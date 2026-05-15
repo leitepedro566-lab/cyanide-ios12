@@ -1,6 +1,7 @@
 name: Build Cyanide IPA (Manual)
 
 on:
+  # 纯手动运行：移除 push 和 pull_request 触发器，仅保留 workflow_dispatch
   workflow_dispatch: 
 
 jobs:
@@ -12,7 +13,7 @@ jobs:
       - name: Checkout Repository
         uses: actions/checkout@v4
         with:
-          submodules: recursive 
+          submodules: recursive # 确保完整拉取 external/ChOma 等子模块
           fetch-depth: 0
 
       - name: Setup Xcode
@@ -22,38 +23,56 @@ jobs:
 
       - name: Install Dependencies
         run: |
+          # 安装 ldid (用于 XPF 的伪签名) 和 xcbeautify (用于格式化 Xcode 输出)
           brew install ldid xcbeautify
 
       - name: Build libxpf.dylib (XPF Framework)
         run: |
+          # 关键步骤：在打包 APP 前，必须先通过 Makefile 编译底层的 XPF 动态库
           echo "==> Building XPF Framework..."
           cd Cyanide/XPF
           make
           
+          # 验证生成，如果未生成会在此处报错阻断，避免打出残缺的 IPA
           ls -la output/ios/libxpf.dylib
           echo "==> XPF Framework built successfully."
 
       - name: Inject SSZipArchive via CocoaPods
         run: |
+          echo "==> Setting up CocoaPods for SSZipArchive..."
+          # 动态创建 Podfile 引入压缩库
           cat << 'EOF' > Podfile
           platform :ios, '14.0'
+          use_frameworks!
+          
           target 'Cyanide' do
             pod 'SSZipArchive'
           end
           EOF
+          
+          # 执行安装，这会生成 Cyanide.xcworkspace
           pod install
-          sed -i '' 's/-project Cyanide.xcodeproj/-workspace Cyanide.xcworkspace/g' scripts/build.sh
+          
+          echo "==> Patching build.sh to use Xcode Workspace..."
+          # 核心修复：自动匹配并强行替换编译脚本中的单项目模式为工作区模式
+          # 无论你的 build.sh 里用的是变量还是硬编码，全部替换为 workspace
+          sed -i '' 's/-project/-workspace/g' scripts/build.sh
+          sed -i '' 's/\.xcodeproj/.xcworkspace/g' scripts/build.sh
+          
+          echo "==> Patched build.sh content:"
+          cat scripts/build.sh
 
       - name: Make Scripts Executable
         run: |
           chmod +x scripts/build.sh
-          chmod +x scripts/release.sh
+          chmod +x scripts/release.sh || true
 
       - name: Build Project and Package IPA
         env:
           CONFIG: Release
           SDK: iphoneos
         run: |
+          # 现在执行构建脚本，Xcode 就能找到 CocoaPods 引入的 SSZipArchive 压缩库了
           ./scripts/build.sh
 
       - name: Upload IPA Artifact
