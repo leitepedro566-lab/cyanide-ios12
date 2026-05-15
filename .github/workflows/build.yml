@@ -37,42 +37,17 @@ jobs:
           ls -la output/ios/libxpf.dylib
           echo "==> XPF Framework built successfully."
 
-      - name: Inject SSZipArchive via CocoaPods
-        run: |
-          echo "==> Setting up CocoaPods for SSZipArchive..."
-          # 动态创建 Podfile 引入压缩库
-          cat << 'EOF' > Podfile
-          platform :ios, '14.0'
-          use_frameworks!
-          
-          target 'Cyanide' do
-            pod 'SSZipArchive'
-          end
-          EOF
-          
-          # 执行安装，这会生成 Cyanide.xcworkspace
-          pod install
-          
-          echo "==> Patching build.sh to use Xcode Workspace..."
-          # 核心修复：自动匹配并强行替换编译脚本中的单项目模式为工作区模式
-          # 无论你的 build.sh 里用的是变量还是硬编码，全部替换为 workspace
-          sed -i '' 's/-project/-workspace/g' scripts/build.sh
-          sed -i '' 's/\.xcodeproj/.xcworkspace/g' scripts/build.sh
-          
-          echo "==> Patched build.sh content:"
-          cat scripts/build.sh
-
       - name: Make Scripts Executable
         run: |
           chmod +x scripts/build.sh
-          chmod +x scripts/release.sh || true
+          chmod +x scripts/release.sh
 
       - name: Build Project and Package IPA
         env:
           CONFIG: Release
           SDK: iphoneos
         run: |
-          # 现在执行构建脚本，Xcode 就能找到 CocoaPods 引入的 SSZipArchive 压缩库了
+          # 现在执行构建脚本，Xcode 就能找到刚刚编译好的 libxpf.dylib 并将其打包进 .app 中
           ./scripts/build.sh
 
       - name: Upload IPA Artifact
