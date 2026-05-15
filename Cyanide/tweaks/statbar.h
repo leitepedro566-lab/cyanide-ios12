@@ -14,6 +14,5 @@ bool statbar_apply(bool celsius, bool hideNet);
 bool statbar_apply_in_session(bool celsius, bool hideNet);
 bool statbar_stop_in_session(void);
 void statbar_forget_remote_state(void);
-bool statbar_resident_agent_active(void);
 
 #endif

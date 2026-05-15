@@ -135,6 +135,7 @@ static const NSInteger kSBCDefaultRows = 6;
 static const BOOL kSBCDefaultHideLabels = NO;
 static const useconds_t kStatBarLiveIntervalUS = 1000000;
 static const NSUInteger kStatBarLiveMaxTicks = 43200;
+static const int64_t kLiveBackgroundTaskGraceSeconds = 10;
 static const useconds_t kRSSILiveIntervalUS = 1000000;
 static const NSUInteger kRSSILiveMaxTicks = 43200;
 static const useconds_t kAxonLiteLiveIntervalUS = 1200000;
@@ -248,6 +249,7 @@ static void settings_apply_statbar_once_async(const char *reason);
 static void settings_apply_rssi_once_async(const char *reason);
 static void settings_start_rssi_live_loop(void);
 static void settings_notify_remote_call_state_changed(void);
+static void settings_request_all_live_loops_stop(const char *reason);
 
 static BOOL settings_should_log_statbar_tick(NSUInteger tick) {
     // One-shot: log the very first tick so the user can see the loop took
@@ -316,9 +318,7 @@ static void settings_handle_springboard_restart(void)
         @synchronized (settings_rc_lock()) {
             hadSession = (g_springboard_rc_ready != 0);
             // Tell live loops to bail at their next interval check.
-            g_statbar_live_stop_requested = 1;
-            g_rssi_live_stop_requested = 1;
-            g_axonlite_live_stop_requested = 1;
+            settings_request_all_live_loops_stop("SpringBoard restart");
             g_springboard_rc_ready = 0;
             g_springboard_sandbox_escaped = 0;
 
@@ -397,7 +397,7 @@ static void settings_install_screen_awake_observers(void)
 
 static void settings_end_statbar_background_task_async(const char *reason)
 {
-    dispatch_async(dispatch_get_main_queue(), ^{
+    void (^endTask)(void) = ^{
         @synchronized (settings_bg_lock()) {
             if (g_statbar_bg_task == UIBackgroundTaskInvalid) return;
             UIBackgroundTaskIdentifier task = g_statbar_bg_task;
@@ -406,32 +406,36 @@ static void settings_end_statbar_background_task_async(const char *reason)
             printf("[SETTINGS] StatBar background task ended%s%s\n",
                    reason ? ": " : "", reason ?: "");
         }
-    });
+    };
+
+    if ([NSThread isMainThread]) {
+        endTask();
+    } else {
+        dispatch_async(dispatch_get_main_queue(), endTask);
+    }
 }
 
-// Anchors background execution with an explicit UIBackgroundTask while a live
-// tweak loop (StatBar/RSSI/Axon Lite) needs to keep ticking. DSKeepAlive's
-// silent-audio assertion extends background time past iOS's default ~30s
-// budget, but without a real task UIKit deprioritizes the app's dispatch
-// queues on the *second* background→foreground→background cycle — which is
-// the regression where StatBar visibly stops refreshing in the status bar.
-// The expiration handler cleans up the task ID if iOS decides to revoke
-// background time anyway.
+// Bridge the foreground -> background transition with a short explicit
+// UIBackgroundTask. DSKeepAlive's audio background mode carries the ongoing
+// live feed; holding a UIBackgroundTask indefinitely trips UIKit's 30s watchdog
+// warning and can get the app terminated.
 static void settings_begin_statbar_background_task_async(const char *reason)
 {
-    dispatch_async(dispatch_get_main_queue(), ^{
+    void (^beginTask)(void) = ^{
         @synchronized (settings_bg_lock()) {
             if (g_statbar_bg_task != UIBackgroundTaskInvalid) return;
             UIApplication *app = [UIApplication sharedApplication];
-            UIBackgroundTaskIdentifier task = [app beginBackgroundTaskWithName:@"cyanide.statbar.live"
-                                                              expirationHandler:^{
-                @synchronized (settings_bg_lock()) {
-                    if (g_statbar_bg_task == UIBackgroundTaskInvalid) return;
-                    UIBackgroundTaskIdentifier expiring = g_statbar_bg_task;
-                    g_statbar_bg_task = UIBackgroundTaskInvalid;
-                    [[UIApplication sharedApplication] endBackgroundTask:expiring];
-                    printf("[SETTINGS] StatBar background task expired by iOS; live loop may pause\n");
-                }
+            __block UIBackgroundTaskIdentifier task = UIBackgroundTaskInvalid;
+            task = [app beginBackgroundTaskWithName:@"cyanide.statbar.live"
+                                  expirationHandler:^{
+                dispatch_async(dispatch_get_main_queue(), ^{
+                    @synchronized (settings_bg_lock()) {
+                        if (g_statbar_bg_task != task) return;
+                        g_statbar_bg_task = UIBackgroundTaskInvalid;
+                        [[UIApplication sharedApplication] endBackgroundTask:task];
+                        printf("[SETTINGS] StatBar background task expired by iOS; live loop may pause\n");
+                    }
+                });
             }];
             if (task == UIBackgroundTaskInvalid) {
                 printf("[SETTINGS] StatBar background task could not be acquired%s%s\n",
@@ -442,8 +446,25 @@ static void settings_begin_statbar_background_task_async(const char *reason)
             printf("[SETTINGS] StatBar background task acquired id=%lu%s%s\n",
                    (unsigned long)task,
                    reason ? ": " : "", reason ?: "");
+            dispatch_after(dispatch_time(DISPATCH_TIME_NOW,
+                                         kLiveBackgroundTaskGraceSeconds * NSEC_PER_SEC),
+                           dispatch_get_main_queue(), ^{
+                @synchronized (settings_bg_lock()) {
+                    if (g_statbar_bg_task != task) return;
+                    g_statbar_bg_task = UIBackgroundTaskInvalid;
+                    [[UIApplication sharedApplication] endBackgroundTask:task];
+                    printf("[SETTINGS] StatBar background task ended: transition grace elapsed; keepAlive=%d\n",
+                           ds_keepalive_is_running());
+                }
+            });
         }
-    });
+    };
+
+    if ([NSThread isMainThread]) {
+        beginTask();
+    } else {
+        dispatch_sync(dispatch_get_main_queue(), beginTask);
+    }
 }
 
 static void settings_notify_remote_call_state_changed(void)
@@ -466,6 +487,39 @@ static void settings_notify_remote_call_state_changed(void)
 static BOOL settings_cleanup_in_progress(void)
 {
     return g_settings_cleanup_running != 0;
+}
+
+static void settings_request_all_live_loops_stop(const char *reason)
+{
+    g_statbar_live_stop_requested = 1;
+    g_rssi_live_stop_requested = 1;
+    g_axonlite_live_stop_requested = 1;
+    if (reason) {
+        printf("[SETTINGS] requested all live RemoteCall loops stop: %s\n", reason);
+    }
+}
+
+static void settings_live_loop_sleep_interruptible(uint64_t targetUS,
+                                                  useconds_t fallbackUS,
+                                                  volatile int *stopFlag)
+{
+    uint64_t sleptFallbackUS = 0;
+    while (!settings_cleanup_in_progress() && (!stopFlag || *stopFlag == 0)) {
+        uint64_t nowUS = settings_now_us();
+        uint64_t remainingUS = 0;
+        if (targetUS != 0 && nowUS != 0 && nowUS < targetUS) {
+            remainingUS = targetUS - nowUS;
+        } else if (targetUS == 0 && sleptFallbackUS < fallbackUS) {
+            remainingUS = (uint64_t)fallbackUS - sleptFallbackUS;
+        } else {
+            break;
+        }
+
+        useconds_t chunkUS = (useconds_t)(remainingUS < 100000ULL ? remainingUS : 100000ULL);
+        if (chunkUS == 0) break;
+        usleep(chunkUS);
+        if (targetUS == 0) sleptFallbackUS += chunkUS;
+    }
 }
 
 static UIViewController *settings_top_view_controller(UIViewController *vc)
@@ -644,11 +698,8 @@ static void settings_destroy_springboard_remote_call_locked(const char *reason)
 static void settings_prepare_for_respring_sync(void)
 {
     log_user("[RESPRING] Stopping live sessions before respring.\n");
-    printf("[SETTINGS] preparing for respring cleanup rcReady=%d statbarResident=%d\n",
-           g_springboard_rc_ready, statbar_resident_agent_active());
-    g_statbar_live_stop_requested = 1;
-    g_rssi_live_stop_requested = 1;
-    g_axonlite_live_stop_requested = 1;
+    printf("[SETTINGS] preparing for respring cleanup rcReady=%d\n", g_springboard_rc_ready);
+    settings_request_all_live_loops_stop("pre-respring cleanup");
     settings_end_statbar_background_task_async("pre-respring cleanup");
 
     @synchronized (settings_rc_lock()) {
@@ -683,9 +734,7 @@ static void settings_terminal_kexploit_cleanup_sync_internal(const char *reason)
     printf("[SETTINGS] terminal KRW cleanup requested%s%s done=%d rcReady=%d\n",
            reason ? ": " : "", reason ?: "",
            g_kexploit_done, g_springboard_rc_ready);
-    g_statbar_live_stop_requested = 1;
-    g_rssi_live_stop_requested = 1;
-    g_axonlite_live_stop_requested = 1;
+    settings_request_all_live_loops_stop("terminal KRW cleanup");
     settings_end_statbar_background_task_async("terminal KRW cleanup");
 
     @synchronized (settings_rc_lock()) {
@@ -766,8 +815,7 @@ static void settings_queue_terminal_kexploit_cleanup(const char *reason)
         return;
     }
 
-    g_statbar_live_stop_requested = 1;
-    g_axonlite_live_stop_requested = 1;
+    settings_request_all_live_loops_stop("queued terminal cleanup");
     settings_end_statbar_background_task_async("queued terminal cleanup");
 
     dispatch_async(dispatch_get_global_queue(0, 0), ^{
@@ -793,9 +841,7 @@ void settings_best_effort_termination_cleanup(const char *reason)
     log_user("[CLEANUP] App termination requested (%s); attempting last-chance cleanup.\n", why);
     printf("[SETTINGS] best-effort termination cleanup requested: %s\n", why);
 
-    g_statbar_live_stop_requested = 1;
-    g_rssi_live_stop_requested = 1;
-    g_axonlite_live_stop_requested = 1;
+    settings_request_all_live_loops_stop("termination cleanup");
 
     BOOL locked = settings_acquire_actions_lock_wait("termination cleanup", 1500000);
     if (!locked) {
@@ -812,9 +858,7 @@ void settings_best_effort_termination_cleanup(const char *reason)
 
 void settings_destroy_springboard_remote_call_sync(void)
 {
-    g_statbar_live_stop_requested = 1;
-    g_rssi_live_stop_requested = 1;
-    g_axonlite_live_stop_requested = 1;
+    settings_request_all_live_loops_stop("remote call sync cleanup");
     settings_end_statbar_background_task_async("remote call sync cleanup");
     @synchronized (settings_rc_lock()) {
         if (g_springboard_rc_ready) {
@@ -827,9 +871,7 @@ void settings_destroy_springboard_remote_call_sync(void)
 
 void settings_destroy_springboard_remote_call(void)
 {
-    g_statbar_live_stop_requested = 1;
-    g_rssi_live_stop_requested = 1;
-    g_axonlite_live_stop_requested = 1;
+    settings_request_all_live_loops_stop("remote call cleanup");
     settings_end_statbar_background_task_async("remote call cleanup");
     log_user("[SESSION] Disconnecting from SpringBoard.\n");
     dispatch_async(dispatch_get_global_queue(0, 0), ^{
@@ -924,9 +966,7 @@ static void settings_run_ota_action(BOOL disable)
                 return;
             }
 
-            g_statbar_live_stop_requested = 1;
-            g_rssi_live_stop_requested = 1;
-            g_axonlite_live_stop_requested = 1;
+            settings_request_all_live_loops_stop("switching to launchd for OTA");
             settings_end_statbar_background_task_async("switching to launchd for OTA");
 
             @synchronized (settings_rc_lock()) {
@@ -955,10 +995,6 @@ static void settings_start_statbar_live_loop(void)
 
     NSUserDefaults *d = [NSUserDefaults standardUserDefaults];
     if (![d boolForKey:kSettingsStatBarEnabled]) return;
-    if (statbar_resident_agent_active()) {
-        printf("[SETTINGS] StatBar resident agent active; app-side loop not needed\n");
-        return;
-    }
 
     if (__sync_lock_test_and_set(&g_statbar_live_running, 1)) {
         // Log-once for the process lifetime; further "already running" hits
@@ -995,7 +1031,9 @@ static void settings_start_statbar_live_loop(void)
                         pausedForSleep = YES;
                         printf("[SETTINGS] StatBar paused while screen is asleep\n");
                     }
-                    usleep(kStatBarLiveIntervalUS);
+                    settings_live_loop_sleep_interruptible(0,
+                                                           kStatBarLiveIntervalUS,
+                                                           &g_statbar_live_stop_requested);
                     nextTickUS = settings_now_us();
                     continue;
                 }
@@ -1042,7 +1080,9 @@ static void settings_start_statbar_live_loop(void)
                             printf("[SETTINGS] StatBar tick=%lu elapsed=%lluus sleep=%lluus\n",
                                    (unsigned long)(tick - 1), elapsedUS, sleepUS);
                         }
-                        usleep((useconds_t)sleepUS);
+                        settings_live_loop_sleep_interruptible(nextTickUS,
+                                                               (useconds_t)sleepUS,
+                                                               &g_statbar_live_stop_requested);
                     } else {
                         uint64_t overrunUS = nowUS - nextTickUS;
                         if (settings_should_log_statbar_tick(tick - 1)) {
@@ -1052,7 +1092,9 @@ static void settings_start_statbar_live_loop(void)
                         nextTickUS = nowUS;
                     }
                 } else {
-                    usleep(kStatBarLiveIntervalUS);
+                    settings_live_loop_sleep_interruptible(0,
+                                                           kStatBarLiveIntervalUS,
+                                                           &g_statbar_live_stop_requested);
                 }
             }
         } @finally {
@@ -1094,15 +1136,14 @@ static void settings_apply_statbar_once_async(const char *reason)
             ok = statbar_apply_in_session([d boolForKey:kSettingsStatBarCelsius],
                                           [d boolForKey:kSettingsStatBarHideNet]);
         }
-        // Only log lifecycle applies that fail or change resident state -
-        // a clean success on every foreground/background flip is noise.
+        // Only log lifecycle applies that change result; a clean success on
+        // every foreground/background flip is noise.
         static volatile int lastResult = -1;
         int now = ok ? 1 : 0;
         if (now != lastResult) {
             lastResult = now;
-            printf("[SETTINGS] StatBar lifecycle apply%s%s result=%d resident=%d\n",
-                   reason ? ": " : "", reason ?: "",
-                   ok, statbar_resident_agent_active());
+            printf("[SETTINGS] StatBar lifecycle apply%s%s result=%d\n",
+                   reason ? ": " : "", reason ?: "", ok);
         }
         settings_start_statbar_live_loop();
     });
@@ -1175,12 +1216,16 @@ static void settings_start_rssi_live_loop(void)
                 if (nextTickUS != 0) {
                     nextTickUS += kRSSILiveIntervalUS;
                     if (nowUS < nextTickUS) {
-                        usleep((useconds_t)(nextTickUS - nowUS));
+                        settings_live_loop_sleep_interruptible(nextTickUS,
+                                                               (useconds_t)(nextTickUS - nowUS),
+                                                               &g_rssi_live_stop_requested);
                     } else {
                         nextTickUS = nowUS;
                     }
                 } else {
-                    usleep(kRSSILiveIntervalUS);
+                    settings_live_loop_sleep_interruptible(0,
+                                                           kRSSILiveIntervalUS,
+                                                           &g_rssi_live_stop_requested);
                 }
             }
         } @finally {
@@ -1265,7 +1310,9 @@ static void settings_start_axonlite_live_loop(void)
                         pausedForSleep = YES;
                         printf("[SETTINGS] Axon Lite paused while screen is asleep\n");
                     }
-                    usleep(kAxonLiteLiveIntervalUS);
+                    settings_live_loop_sleep_interruptible(0,
+                                                           kAxonLiteLiveIntervalUS,
+                                                           &g_axonlite_live_stop_requested);
                     nextTickUS = settings_now_us();
                     continue;
                 }
@@ -1309,12 +1356,16 @@ static void settings_start_axonlite_live_loop(void)
                 if (nextTickUS != 0) {
                     nextTickUS += kAxonLiteLiveIntervalUS;
                     if (nowUS < nextTickUS) {
-                        usleep((useconds_t)(nextTickUS - nowUS));
+                        settings_live_loop_sleep_interruptible(nextTickUS,
+                                                               (useconds_t)(nextTickUS - nowUS),
+                                                               &g_axonlite_live_stop_requested);
                     } else {
                         nextTickUS = nowUS;
                     }
                 } else {
-                    usleep(kAxonLiteLiveIntervalUS);
+                    settings_live_loop_sleep_interruptible(0,
+                                                           kAxonLiteLiveIntervalUS,
+                                                           &g_axonlite_live_stop_requested);
                 }
 
                 uint64_t elapsedUS = tickStartUS != 0 && nowUS >= tickStartUS ? nowUS - tickStartUS : 0;
@@ -1364,10 +1415,15 @@ void settings_application_did_enter_background(void)
     BOOL anyLiveLoopNeeded =
         ([d boolForKey:kSettingsAxonLiteEnabled]    && g_springboard_rc_ready) ||
         ([d boolForKey:kSettingsRSSIDisplayEnabled] && g_springboard_rc_ready) ||
-        ([d boolForKey:kSettingsStatBarEnabled]     && g_springboard_rc_ready &&
-         !statbar_resident_agent_active());
+        ([d boolForKey:kSettingsStatBarEnabled]     && g_springboard_rc_ready);
     if (anyLiveLoopNeeded) {
+        if ([d boolForKey:kSettingsKeepAlive]) {
+            ds_keepalive_apply_enabled(YES);
+        }
         settings_begin_statbar_background_task_async("entered background");
+        printf("[SETTINGS] background live-loop support keepAlive=%d bgTask=%lu\n",
+               ds_keepalive_is_running(),
+               (unsigned long)g_statbar_bg_task);
     }
 
     if ([d boolForKey:kSettingsAxonLiteEnabled] && g_springboard_rc_ready) {
@@ -1376,9 +1432,7 @@ void settings_application_did_enter_background(void)
     if ([d boolForKey:kSettingsRSSIDisplayEnabled] && g_springboard_rc_ready) {
         settings_apply_rssi_once_async("entered background");
     }
-    if (![d boolForKey:kSettingsStatBarEnabled] ||
-        statbar_resident_agent_active() ||
-        !g_springboard_rc_ready) {
+    if (![d boolForKey:kSettingsStatBarEnabled] || !g_springboard_rc_ready) {
         return;
     }
 
@@ -1485,8 +1539,7 @@ static void settings_schedule_live_apply_for_key(NSString *key)
                     if (settings_cleanup_in_progress() || !g_springboard_rc_ready) return;
                     bool ok = statbar_apply_in_session([d boolForKey:kSettingsStatBarCelsius],
                                                        [d boolForKey:kSettingsStatBarHideNet]);
-                    printf("[SETTINGS] live StatBar apply result=%d resident=%d\n",
-                           ok, statbar_resident_agent_active());
+                    printf("[SETTINGS] live StatBar apply result=%d\n", ok);
                 }
                 settings_start_statbar_live_loop();
             });
@@ -1762,12 +1815,10 @@ void settings_run_actions(void)
                         settings_progress(&step, total, "Starting StatBar overlay and 1s feed");
                         bool ok = statbar_apply_in_session([d boolForKey:kSettingsStatBarCelsius],
                                                            [d boolForKey:kSettingsStatBarHideNet]);
-                        printf("[SETTINGS] StatBar result=%d resident=%d\n",
-                               ok, statbar_resident_agent_active());
-                        log_user("%s StatBar %s; resident=%s.\n",
+                        printf("[SETTINGS] StatBar result=%d\n", ok);
+                        log_user("%s StatBar %s.\n",
                                  ok ? "[OK]" : "[WARN]",
-                                 ok ? "receiving live data" : "did not start cleanly",
-                                 statbar_resident_agent_active() ? "yes" : "no");
+                                 ok ? "receiving live data" : "did not start cleanly");
                     }
 
                     if (runRSSI) {
@@ -1800,7 +1851,7 @@ void settings_run_actions(void)
                     }
                 }
 
-                if (runStatBar && !statbar_resident_agent_active()) {
+                if (runStatBar) {
                     settings_start_statbar_live_loop();
                 } else {
                     g_statbar_live_stop_requested = 1;

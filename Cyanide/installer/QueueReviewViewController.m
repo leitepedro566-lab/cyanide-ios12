@@ -199,7 +199,7 @@ typedef NS_ENUM(NSInteger, QueueReviewSection) {
 {
     if ((QueueReviewSection)section != QueueReviewSectionReApply) return nil;
     if ([self reApplyPackages].count == 0) return nil;
-    return @"These are still installed from earlier sessions. Confirming the queue re-runs the chain, which re-applies every installed tweak (RemoteCall state doesn't survive a force-quit). To stop one from running, uninstall it from the Installer tab, or use Reset All Packages in Settings → Quick Actions.";
+    return @"These are already installed, not newly queued changes. Confirming re-runs the chain so installed RemoteCall-backed tweaks come back after a force-quit. To stop one from running, uninstall it from the Installer tab, or use Reset All Packages in Settings → Quick Actions.";
 }
 
 - (UITableViewCell *)tableView:(UITableView *)tableView cellForRowAtIndexPath:(NSIndexPath *)indexPath
@@ -223,7 +223,7 @@ typedef NS_ENUM(NSInteger, QueueReviewSection) {
             cell.detailTextLabel.textColor = UIColor.systemRedColor;
             break;
         case QueueReviewSectionReApply:
-            cell.detailTextLabel.text = @"Queued from prior install";
+            cell.detailTextLabel.text = @"Installed; will re-apply";
             cell.detailTextLabel.textColor = UIColor.secondaryLabelColor;
             break;
         default:

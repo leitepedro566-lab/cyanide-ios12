@@ -35,9 +35,6 @@
 			isa = PBXFileSystemSynchronizedBuildFileExceptionSet;
 			membershipExceptions = (
 				Info.plist,
-				resident/output/libdsstatbaragent.arm64.thin,
-				resident/output/libdsstatbaragent.arm64e.thin,
-				resident/output/libdsstatbaragent.dylib,
 				XPF/.gitignore,
 				XPF/.gitmodules,
 				XPF/.vscode/settings.json,
@@ -99,11 +96,9 @@
 			isa = PBXFileSystemSynchronizedGroupBuildPhaseMembershipExceptionSet;
 			attributesByRelativePath = {
 				XPF/output/ios/libxpf.dylib = (CodeSignOnCopy, );
-				resident/output/libdsstatbaragent.dylib = (CodeSignOnCopy, );
 			};
 			buildPhase = AAA2989D2F7418CC000B5902 /* CopyFiles */;
 			membershipExceptions = (
-				resident/output/libdsstatbaragent.dylib,
 				XPF/output/ios/libxpf.dylib,
 			);
 		};
@@ -332,7 +327,7 @@
 			);
 			runOnlyForDeploymentPostprocessing = 0;
 			shellPath = /bin/sh;
-			shellScript = "make -C \"$SRCROOT/Cyanide/XPF\" output/ios/libxpf.dylib\n\nAGENT_SRC=\"$SRCROOT/resident/DSStatBarAgent.m\"\nAGENT_OUT_DIR=\"$SRCROOT/Cyanide/resident/output\"\nAGENT_ARM64=\"$AGENT_OUT_DIR/libdsstatbaragent.arm64.thin\"\nAGENT_ARM64E=\"$AGENT_OUT_DIR/libdsstatbaragent.arm64e.thin\"\nAGENT_OUT=\"$AGENT_OUT_DIR/libdsstatbaragent.dylib\"\nSDK=\"$(xcrun --sdk iphoneos --show-sdk-path)\"\nCLANG=\"$(xcrun --find clang)\"\nmkdir -p \"$AGENT_OUT_DIR\"\n\"$CLANG\" -target arm64-apple-ios17.0 -isysroot \"$SDK\" -miphoneos-version-min=17.0 -dynamiclib -fobjc-arc \"$AGENT_SRC\" -framework UIKit -framework Foundation -framework CoreFoundation -framework CoreGraphics -o \"$AGENT_ARM64\" -install_name \"@rpath/libdsstatbaragent.dylib\"\n\"$CLANG\" -target arm64e-apple-ios17.0 -isysroot \"$SDK\" -miphoneos-version-min=17.0 -dynamiclib -fobjc-arc \"$AGENT_SRC\" -framework UIKit -framework Foundation -framework CoreFoundation -framework CoreGraphics -o \"$AGENT_ARM64E\" -install_name \"@rpath/libdsstatbaragent.dylib\"\nlipo -create \"$AGENT_ARM64\" \"$AGENT_ARM64E\" -output \"$AGENT_OUT\"\n";
+			shellScript = "make -C \"$SRCROOT/Cyanide/XPF\" output/ios/libxpf.dylib\n";
 		};
 /* End PBXShellScriptBuildPhase section */
 
@@ -381,7 +376,7 @@
 					"$(PROJECT_DIR)/Cyanide/XPF/external/ChOma/external/ios",
 					"$(PROJECT_DIR)/Cyanide/resident/output",
 				);
-				MARKETING_VERSION = 1.0.18;
+				MARKETING_VERSION = 1.0.19;
 				OTHER_CFLAGS = "";
 				PRODUCT_BUNDLE_IDENTIFIER = com.zeroxjf.cyanide;
 				PRODUCT_NAME = Cyanide;
@@ -429,7 +424,7 @@
 					"$(PROJECT_DIR)/Cyanide/XPF/external/ChOma/external/ios",
 					"$(PROJECT_DIR)/Cyanide/resident/output",
 				);
-				MARKETING_VERSION = 1.0.18;
+				MARKETING_VERSION = 1.0.19;
 				OTHER_CFLAGS = "";
 				PRODUCT_BUNDLE_IDENTIFIER = com.zeroxjf.cyanide;
 				PRODUCT_NAME = Cyanide;

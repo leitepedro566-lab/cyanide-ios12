@@ -5,7 +5,6 @@
 
 #import "Package.h"
 #import "PackageQueue.h"
-#import "../SettingsViewController.h"
 #import "../tweaks/darksword_ota.h"
 
 NSString * const kInstallerOTADisabledIntent = @"installer.ota.disabledIntent";
@@ -46,11 +45,13 @@ NSString * const kInstallerOTADisabledIntent = @"installer.ota.disabledIntent";
     NSUserDefaults *d = [NSUserDefaults standardUserDefaults];
     switch (self.kind) {
         case PackageInstallKindToggle:
-            // Both the user's persisted intent AND a successful apply in the
-            // current session — otherwise "Installed" lies after a restart.
+            // Installer state is the user's persisted install intent. Whether
+            // the tweak is currently applied is session state: RemoteCall-backed
+            // tweaks need Run/Apply after a relaunch, but they are still
+            // installed packages and should queue uninstall, not a duplicate
+            // install.
             if (!self.enabledKey) return NO;
-            if (![d boolForKey:self.enabledKey]) return NO;
-            return settings_tweak_is_applied(self.enabledKey);
+            return [d boolForKey:self.enabledKey];
         case PackageInstallKindOTA:
             // OTA edits launchd disabled.plist which persists across reboots,
             // so the intent flag IS the actual state.

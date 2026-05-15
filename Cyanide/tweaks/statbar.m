@@ -326,12 +326,8 @@ static uint64_t gStatBarPerformMainSel = 0;
 static uint64_t gStatBarNSStringClass = 0;
 static uint64_t gStatBarAllocSel = 0;
 static uint64_t gStatBarInitUTF8Sel = 0;
-static uint64_t gStatBarAgentHandle = 0;
-static uint64_t gStatBarAgentStart = 0;
-static uint64_t gStatBarAgentStop = 0;
-static bool gStatBarAgentActive = false;
-static bool gStatBarAgentLoadAttempted = false;
-static const bool kStatBarResidentAgentEnabled = false;
+
+static void statbar_clear_cached_layout(void);
 
 static bool statbar_should_log_tick(void)
 {
@@ -340,96 +336,29 @@ static bool statbar_should_log_tick(void)
     return gStatBarApplyTick == 1;
 }
 
-static uint64_t statbar_remote_dlsym(uint64_t handle, const char *name)
-{
-    uint64_t symName = r_alloc_str(name);
-    if (!symName) return 0;
-    uint64_t sym = r_dlsym_call(R_TIMEOUT, "dlsym", handle, symName, 0, 0, 0, 0, 0, 0);
-    r_free(symName);
-    return sym;
-}
-
-static void statbar_log_remote_dlerror(const char *context)
-{
-    uint64_t err = r_dlsym_call(R_TIMEOUT, "dlerror", 0, 0, 0, 0, 0, 0, 0, 0);
-    if (!err) {
-        printf("[STATBAR] agent: %s failed without dlerror\n", context);
-        return;
-    }
-
-    char buf[512];
-    memset(buf, 0, sizeof(buf));
-    if (remote_read(err, buf, sizeof(buf) - 1)) {
-        printf("[STATBAR] agent: %s failed: %s\n", context, buf);
-    } else {
-        printf("[STATBAR] agent: %s failed: dlerror unreadable at 0x%llx\n", context, err);
-    }
-}
-
-static bool statbar_load_resident_agent(void)
-{
-    if (gStatBarAgentHandle && gStatBarAgentStart) return true;
-    if (!kStatBarResidentAgentEnabled) {
-        if (!gStatBarAgentLoadAttempted) {
-            gStatBarAgentLoadAttempted = true;
-            printf("[STATBAR] agent: disabled; using RemoteCall overlay\n");
-        }
-        return false;
-    }
-    if (gStatBarAgentLoadAttempted) return false;
-    gStatBarAgentLoadAttempted = true;
-
-    NSString *path = [NSBundle.mainBundle pathForResource:@"libdsstatbaragent" ofType:@"dylib"];
-    if (path.length == 0) {
-        printf("[STATBAR] agent: embedded dylib missing\n");
-        return false;
-    }
-
-    printf("[STATBAR] agent: dlopen %s\n", path.UTF8String);
-    uint64_t remotePath = r_alloc_str(path.UTF8String);
-    if (!remotePath) return false;
-
-    r_dlsym_call(R_TIMEOUT, "dlerror", 0, 0, 0, 0, 0, 0, 0, 0);
-    uint64_t handle = r_dlsym_call(1000, "dlopen", remotePath, RTLD_NOW | RTLD_GLOBAL, 0, 0, 0, 0, 0, 0);
-    r_free(remotePath);
-    if (!handle) {
-        statbar_log_remote_dlerror("dlopen");
-        return false;
-    }
-
-    uint64_t start = statbar_remote_dlsym(handle, "ds_statbar_agent_start");
-    uint64_t stop = statbar_remote_dlsym(handle, "ds_statbar_agent_stop");
-    if (!start || !stop) {
-        statbar_log_remote_dlerror("dlsym");
-        return false;
-    }
-
-    gStatBarAgentHandle = handle;
-    gStatBarAgentStart = start;
-    gStatBarAgentStop = stop;
-    printf("[STATBAR] agent: loaded handle=0x%llx start=0x%llx stop=0x%llx\n",
-           handle, start, stop);
-    return true;
-}
-
-bool statbar_resident_agent_active(void)
-{
-    return gStatBarAgentActive;
-}
-
 bool statbar_stop_in_session(void)
 {
-    if (!statbar_load_resident_agent() || !gStatBarAgentStop) {
-        gStatBarAgentActive = false;
-        return false;
+    uint64_t UIApplication = r_class("UIApplication");
+    if (!r_is_objc_ptr(UIApplication)) return false;
+
+    uint64_t app = r_msg2_main(UIApplication, "sharedApplication", 0, 0, 0, 0);
+    if (!r_is_objc_ptr(app)) return false;
+
+    uint64_t assocKey = r_sel("darkswordStatBarOverlayWindow");
+    if (!assocKey) return false;
+
+    uint64_t win = r_dlsym_call(R_TIMEOUT, "objc_getAssociatedObject",
+                                app, assocKey, 0, 0, 0, 0, 0, 0);
+    if (r_is_objc_ptr(win)) {
+        r_msg2_main(win, "setHidden:", 1, 0, 0, 0);
+        r_dlsym_call(R_TIMEOUT, "objc_setAssociatedObject", app, assocKey, 0, 1, 0, 0, 0, 0);
     }
 
-    uint64_t ret = do_remote_call_stable_addr(R_TIMEOUT, gStatBarAgentStop,
-                                              "ds_statbar_agent_stop",
-                                              0, 0, 0, 0, 0, 0, 0, 0);
-    gStatBarAgentActive = false;
-    printf("[STATBAR] agent: stop ret=0x%llx\n", ret);
-    return ret != 0;
+    gStatBarOverlayWindow = 0;
+    gStatBarOverlayLabel = 0;
+    statbar_clear_cached_layout();
+    printf("[STATBAR] overlay: stopped\n");
+    return true;
 }
 
 void statbar_forget_remote_state(void)
@@ -447,12 +376,7 @@ void statbar_forget_remote_state(void)
     gStatBarNSStringClass = 0;
     gStatBarAllocSel = 0;
     gStatBarInitUTF8Sel = 0;
-    gStatBarAgentHandle = 0;
-    gStatBarAgentStart = 0;
-    gStatBarAgentStop = 0;
-    gStatBarAgentActive = false;
-    gStatBarAgentLoadAttempted = false;
-    printf("[STATBAR] forgot remote overlay/agent state\n");
+    printf("[STATBAR] forgot remote overlay state\n");
 }
 
 static double statbar_overlay_width(bool hideNet)
@@ -879,22 +803,6 @@ recurse: {
 bool statbar_apply_in_session(bool celsius, bool hideNet)
 {
     gStatBarApplyTick++;
-    if (statbar_load_resident_agent() && gStatBarAgentStart) {
-        uint64_t ret = do_remote_call_stable_addr(R_TIMEOUT, gStatBarAgentStart,
-                                                  "ds_statbar_agent_start",
-                                                  celsius ? 1 : 0,
-                                                  hideNet ? 1 : 0,
-                                                  0, 0, 0, 0, 0, 0);
-        if (ret) {
-            gStatBarAgentActive = true;
-            if (statbar_should_log_tick())
-                printf("[STATBAR] agent: start/update ret=0x%llx celsius=%d hideNet=%d\n",
-                       ret, celsius, hideNet);
-            return true;
-        }
-        printf("[STATBAR] agent: start returned 0, falling back to remote overlay\n");
-    }
-
     NSString *text = build_text(celsius, hideNet);
     if (statbar_should_log_tick()) {
         printf("[STATBAR] === entry === text='%s' celsius=%d hideNet=%d tick=%llu\n",
