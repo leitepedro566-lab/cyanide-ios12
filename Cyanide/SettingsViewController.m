@@ -29,7 +29,6 @@
 #import <mach-o/dyld_images.h>
 #import <mach-o/fat.h>
 #import <sys/sysctl.h>
-#import <libproc.h>
 #import <SSZipArchive/SSZipArchive.h>
 
 @interface DSRespringViewController : UIViewController <WKNavigationDelegate>
@@ -160,6 +159,10 @@ static NSString * const kSettingsRemoteCallStateDidChangeNotification = @"Settin
 NSString * const kSettingsActionsDidCompleteNotification = @"SettingsActionsDidCompleteNotification";
 static NSArray<NSString *> * const kPowercuffLevels = nil;
 
+// Session-scoped record of which tweaks were actually applied since launch.
+// Distinct from the persisted NSUserDefaults enable flag — these are wiped on
+// app launch and whenever the SpringBoard RemoteCall session is torn down, so
+// the UI can show accurate "Installed" state rather than a stale toggle.
 static NSMutableSet<NSString *> *g_applied_tweak_keys = nil;
 
 static NSMutableSet<NSString *> *settings_applied_keys_set(void)
@@ -271,6 +274,9 @@ static void settings_notify_remote_call_state_changed(void);
 static void settings_request_all_live_loops_stop(const char *reason);
 
 static BOOL settings_should_log_statbar_tick(NSUInteger tick) {
+    // One-shot: log the very first tick so the user can see the loop took
+    // off, then go silent forever. The polling continues; we just stop
+    // narrating it.
     return tick == 0;
 }
 
@@ -350,10 +356,16 @@ static BOOL settings_statbar_screen_awake(void)
 
 static void settings_handle_springboard_restart(void)
 {
+    // SpringBoard just (re)started. Every pointer we cached from the previous
+    // SB incarnation — class addresses, selector slots, retained objects,
+    // ivar offsets, the trojan thread, our shmem map — is stale. Calling
+    // through any of them under SB-2 hands a wild signed function pointer to
+    // BLRAA and PAC-faults us. Drop everything before the next loop tick.
     dispatch_async(dispatch_get_global_queue(QOS_CLASS_USER_INITIATED, 0), ^{
         BOOL hadSession = NO;
         @synchronized (settings_rc_lock()) {
             hadSession = (g_springboard_rc_ready != 0);
+            // Tell live loops to bail at their next interval check.
             settings_request_all_live_loops_stop("SpringBoard restart");
             g_springboard_rc_ready = 0;
             g_springboard_sandbox_escaped = 0;
@@ -402,6 +414,10 @@ static void settings_install_screen_awake_observers(void)
             g_display_status_notify_token = NOTIFY_TOKEN_INVALID;
         }
 
+        // Darwin notify fires when SpringBoard finishes its boot/respawn.
+        // Either we just launched and SB is fine (cleanup is a no-op against
+        // already-zero state) or SB crashed under us and we MUST drop every
+        // cached pointer before the live loops fire again into SB-2.
         status = notify_register_dispatch("com.apple.springboard.finishedstartup",
                                           &g_springboard_finished_startup_notify_token,
                                           dispatch_get_main_queue(), ^(int token) {
@@ -412,6 +428,9 @@ static void settings_install_screen_awake_observers(void)
             g_springboard_finished_startup_notify_token = NOTIFY_TOKEN_INVALID;
         }
 
+        // If the live loop tripped its 3-failure exit during a background
+        // window, the screen-wake darwin notifications won't fire (the screen
+        // never blanked) and the loop stays dead. Re-arm on app foreground.
         [[NSNotificationCenter defaultCenter] addObserverForName:UIApplicationDidBecomeActiveNotification
                                                           object:nil
                                                            queue:[NSOperationQueue mainQueue]
@@ -445,6 +464,10 @@ static void settings_end_statbar_background_task_async(const char *reason)
     }
 }
 
+// Bridge the foreground -> background transition with a short explicit
+// UIBackgroundTask. DSKeepAlive's audio background mode carries the ongoing
+// live feed; holding a UIBackgroundTask indefinitely trips UIKit's 30s watchdog
+// warning and can get the app terminated.
 static void settings_begin_statbar_background_task_async(const char *reason)
 {
     void (^beginTask)(void) = ^{
@@ -1028,6 +1051,8 @@ static void settings_start_statbar_live_loop(void)
     if (![d boolForKey:kSettingsStatBarEnabled]) return;
 
     if (__sync_lock_test_and_set(&g_statbar_live_running, 1)) {
+        // Log-once for the process lifetime; further "already running" hits
+        // during foreground/background lifecycle churn are pure noise.
         static volatile int loggedAlready = 0;
         if (__sync_bool_compare_and_swap(&loggedAlready, 0, 1)) {
             printf("[SETTINGS] StatBar live loop already running\n");
@@ -1179,6 +1204,8 @@ static void settings_apply_statbar_once_async(const char *reason)
             ok = statbar_apply_in_session([d boolForKey:kSettingsStatBarCelsius],
                                           [d boolForKey:kSettingsStatBarHideNet]);
         }
+        // Only log lifecycle applies that change result; a clean success on
+        // every foreground/background flip is noise.
         static volatile int lastResult = -1;
         int now = ok ? 1 : 0;
         if (now != lastResult) {
@@ -1386,6 +1413,11 @@ static void settings_start_axonlite_live_loop(void)
                    tick < kAxonLiteLiveMaxTicks) {
                 useconds_t intervalUS = settings_live_interval(kAxonLiteLiveIntervalUS,
                                                                kAxonLiteLiveBackgroundIntervalUS);
+                // While the screen is blank, SB tears down cover-sheet view
+                // controllers to free memory. Calling into our cached
+                // gAxonCLVC etc during that window risks dereferencing freed
+                // objects (the PAC-fault path we keep hitting). Pause until
+                // the screen wakes; on wake the loop re-finds CLVC fresh.
                 if (!settings_statbar_screen_awake()) {
                     if (!pausedForSleep) {
                         pausedForSleep = YES;
@@ -1400,6 +1432,9 @@ static void settings_start_axonlite_live_loop(void)
                 if (pausedForSleep) {
                     pausedForSleep = NO;
                     printf("[SETTINGS] Axon Lite resumed after screen wake\n");
+                    // SB likely rebuilt the cover sheet during the blank
+                    // window; the cached CLVC we held is stale. Drop it so
+                    // the next tick walks the windows again.
                     axonlite_forget_remote_state();
                 }
 
@@ -2563,15 +2598,13 @@ static pid_t get_pid_by_exec_name(NSString *execName) {
         pid_t pid = kp[i].kp_proc.p_pid;
         if (pid <= 0) continue;
         NSString *comm = [NSString stringWithUTF8String:kp[i].kp_proc.p_comm];
-        if ([execName hasPrefix:comm]) {
-            char pathBuffer[PROC_PIDPATHINFO_MAXSIZE];
-            if (proc_pidpath(pid, pathBuffer, sizeof(pathBuffer)) > 0) {
-                NSString *path = [NSString stringWithUTF8String:pathBuffer];
-                if ([[path lastPathComponent] isEqualToString:execName]) {
-                    ret = pid;
-                    break;
-                }
-            } else if (execName.length <= 15 && [execName isEqualToString:comm]) {
+        if (execName.length > 15) {
+            if ([[execName substringToIndex:15] isEqualToString:comm]) {
+                ret = pid;
+                break;
+            }
+        } else {
+            if ([execName isEqualToString:comm]) {
                 ret = pid;
                 break;
             }
