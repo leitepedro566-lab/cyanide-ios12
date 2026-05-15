@@ -24,6 +24,12 @@
 #import <sys/utsname.h>
 #import <time.h>
 #import <unistd.h>
+#import <mach-o/loader.h>
+#import <mach-o/fat.h>
+#import <mach/mach.h>
+#import <SSZipArchive/SSZipArchive.h>
+
+static BOOL settings_ensure_kexploit(void);
 
 @interface DSRespringViewController : UIViewController <WKNavigationDelegate>
 @property (nonatomic, strong) WKWebView *webView;
@@ -32,6 +38,7 @@
 @implementation DSRespringViewController
 
 - (void)viewDidLoad {
+    [super FinderLoad];
     [super viewDidLoad];
     self.view.backgroundColor = [UIColor colorWithRed:0.043 green:0.043 blue:0.063 alpha:1.0];
     self.title = @"Respring";
@@ -154,12 +161,41 @@ NSString * const kSettingsActionsDidCompleteNotification = @"SettingsActionsDidC
 static NSArray<NSString *> * const kPowercuffLevels = nil;
 
 // Session-scoped record of which tweaks were actually applied since launch.
-// Distinct from the persisted NSUserDefaults enable flag — these are wiped on
-// app launch and whenever the SpringBoard RemoteCall session is torn down, so
-// the UI can show accurate "Installed" state rather than a stale toggle.
 static NSMutableSet<NSString *> *g_applied_tweak_keys = nil;
 
-static NSMutableSet<NSString *> *settings_applied_keys_set(void)
+/* ========================================================================= */
+/* Opaque Core Structures for launchd IPC                                   */
+/* ========================================================================= */
+typedef void* xpc_object_t;
+typedef const struct _xpc_type_s* xpc_type_t;
+extern const struct _xpc_type_s _xpc_type_dictionary;
+extern const struct _xpc_type_s _xpc_type_uuid;
+#define XPC_TYPE_DICT (&_xpc_type_dictionary)
+#define XPC_TYPE_UID (&_xpc_type_uuid)
+
+extern xpc_type_t xpc_get_type(xpc_object_t object);
+extern xpc_object_t xpc_dictionary_get_value(xpc_object_t xdict, const char* key);
+extern uint64_t xpc_dictionary_get_uint64(xpc_object_t xdict, const char* key);
+extern int64_t xpc_dictionary_get_int64(xpc_object_t xdict, const char* key);
+extern bool xpc_dictionary_get_bool(xpc_object_t xdict, const char* key);
+extern void xpc_dictionary_set_uint64(xpc_object_t xdict, const char* key, uint64_t value);
+extern const uint8_t* xpc_uuid_get_bytes(xpc_object_t xuuid);
+extern xpc_object_t _CFXPCCreateXPCObjectFromCFObject(id cfObject);
+extern kern_return_t _launch_job_routine(uint32_t selector, xpc_object_t request, xpc_object_t *response);
+extern kern_return_t mach_vm_read_overwrite(task_t target_task, mach_vm_address_t address, mach_vm_size_t size, mach_vm_address_t data, mach_vm_size_t *outsize);
+
+struct struct_all_image_infos {
+    uint32_t version;
+    uint32_t infoArrayCount;
+    uint64_t infoArray;
+};
+struct struct_image_info {
+    uint64_t imageLoadAddress;
+    uint64_t imageFilePath;
+    uint64_t imageFileModDate;
+};
+
+static NSMutableSet *settings_applied_keys_set(void)
 {
     static dispatch_once_t once;
     dispatch_once(&once, ^{
@@ -268,9 +304,6 @@ static void settings_notify_remote_call_state_changed(void);
 static void settings_request_all_live_loops_stop(const char *reason);
 
 static BOOL settings_should_log_statbar_tick(NSUInteger tick) {
-    // One-shot: log the very first tick so the user can see the loop took
-    // off, then go silent forever. The polling continues; we just stop
-    // narrating it.
     return tick == 0;
 }
 
@@ -350,16 +383,10 @@ static BOOL settings_statbar_screen_awake(void)
 
 static void settings_handle_springboard_restart(void)
 {
-    // SpringBoard just (re)started. Every pointer we cached from the previous
-    // SB incarnation — class addresses, selector slots, retained objects,
-    // ivar offsets, the trojan thread, our shmem map — is stale. Calling
-    // through any of them under SB-2 hands a wild signed function pointer to
-    // BLRAA and PAC-faults us. Drop everything before the next loop tick.
     dispatch_async(dispatch_get_global_queue(QOS_CLASS_USER_INITIATED, 0), ^{
         BOOL hadSession = NO;
         @synchronized (settings_rc_lock()) {
             hadSession = (g_springboard_rc_ready != 0);
-            // Tell live loops to bail at their next interval check.
             settings_request_all_live_loops_stop("SpringBoard restart");
             g_springboard_rc_ready = 0;
             g_springboard_sandbox_escaped = 0;
@@ -371,8 +398,7 @@ static void settings_handle_springboard_restart(void)
                 abandon_remote_call();
             }
         }
-        printf("[SETTINGS] SpringBoard restart observed; dropped RemoteCall state (hadSession=%d)\n",
-               (int)hadSession);
+        printf("[SETTINGS] SpringBoard restart observed; dropped RemoteCall state (hadSession=%d)\n", (int)hadSession);
         if (hadSession) {
             log_user("[APP] SpringBoard restarted; tweak sessions cleared. Hit Run to rebuild.\n");
         }
@@ -408,10 +434,6 @@ static void settings_install_screen_awake_observers(void)
             g_display_status_notify_token = NOTIFY_TOKEN_INVALID;
         }
 
-        // Darwin notify fires when SpringBoard finishes its boot/respawn.
-        // Either we just launched and SB is fine (cleanup is a no-op against
-        // already-zero state) or SB crashed under us and we MUST drop every
-        // cached pointer before the live loops fire again into SB-2.
         status = notify_register_dispatch("com.apple.springboard.finishedstartup",
                                           &g_springboard_finished_startup_notify_token,
                                           dispatch_get_main_queue(), ^(int token) {
@@ -422,9 +444,6 @@ static void settings_install_screen_awake_observers(void)
             g_springboard_finished_startup_notify_token = NOTIFY_TOKEN_INVALID;
         }
 
-        // If the live loop tripped its 3-failure exit during a background
-        // window, the screen-wake darwin notifications won't fire (the screen
-        // never blanked) and the loop stays dead. Re-arm on app foreground.
         [[NSNotificationCenter defaultCenter] addObserverForName:UIApplicationDidBecomeActiveNotification
                                                           object:nil
                                                            queue:[NSOperationQueue mainQueue]
@@ -446,8 +465,7 @@ static void settings_end_statbar_background_task_async(const char *reason)
             UIBackgroundTaskIdentifier task = g_statbar_bg_task;
             g_statbar_bg_task = UIBackgroundTaskInvalid;
             [[UIApplication sharedApplication] endBackgroundTask:task];
-            printf("[SETTINGS] StatBar background task ended%s%s\n",
-                   reason ? ": " : "", reason ?: "");
+            printf("[SETTINGS] StatBar background task ended%s%s\n", reason ? ": " : "", reason ?: "");
         }
     };
 
@@ -458,10 +476,6 @@ static void settings_end_statbar_background_task_async(const char *reason)
     }
 }
 
-// Bridge the foreground -> background transition with a short explicit
-// UIBackgroundTask. DSKeepAlive's audio background mode carries the ongoing
-// live feed; holding a UIBackgroundTask indefinitely trips UIKit's 30s watchdog
-// warning and can get the app terminated.
 static void settings_begin_statbar_background_task_async(const char *reason)
 {
     void (^beginTask)(void) = ^{
@@ -481,23 +495,18 @@ static void settings_begin_statbar_background_task_async(const char *reason)
                 });
             }];
             if (task == UIBackgroundTaskInvalid) {
-                printf("[SETTINGS] StatBar background task could not be acquired%s%s\n",
-                       reason ? ": " : "", reason ?: "");
+                printf("[SETTINGS] StatBar background task could not be acquired%s%s\n", reason ? ": " : "", reason ?: "");
                 return;
             }
             g_statbar_bg_task = task;
-            printf("[SETTINGS] StatBar background task acquired id=%lu%s%s\n",
-                   (unsigned long)task,
-                   reason ? ": " : "", reason ?: "");
-            dispatch_after(dispatch_time(DISPATCH_TIME_NOW,
-                                         kLiveBackgroundTaskGraceSeconds * NSEC_PER_SEC),
+            printf("[SETTINGS] StatBar background task acquired id=%lu%s%s\n", (unsigned long)task, reason ? ": " : "", reason ?: "");
+            dispatch_after(dispatch_time(DISPATCH_TIME_NOW, kLiveBackgroundTaskGraceSeconds * NSEC_PER_SEC),
                            dispatch_get_main_queue(), ^{
                 @synchronized (settings_bg_lock()) {
                     if (g_statbar_bg_task != task) return;
                     g_statbar_bg_task = UIBackgroundTaskInvalid;
                     [[UIApplication sharedApplication] endBackgroundTask:task];
-                    printf("[SETTINGS] StatBar background task ended: transition grace elapsed; keepAlive=%d\n",
-                           ds_keepalive_is_running());
+                    printf("[SETTINGS] StatBar background task ended: transition grace elapsed; keepAlive=%d\n", ds_keepalive_is_running());
                 }
             });
         }
@@ -518,13 +527,10 @@ static void settings_notify_remote_call_state_changed(void)
         cleared = settings_clear_all_applied_locked();
     }
     dispatch_async(dispatch_get_main_queue(), ^{
-        [[NSNotificationCenter defaultCenter] postNotificationName:kSettingsRemoteCallStateDidChangeNotification
-                                                            object:nil];
+        [[NSNotificationCenter defaultCenter] postNotificationName:kSettingsRemoteCallStateDidChangeNotification object:nil];
         if (cleared) {
-            [[NSNotificationCenter defaultCenter] postNotificationName:PackageQueueDidChangeNotification
-                                                                object:[PackageQueue sharedQueue]];
-            [[NSNotificationCenter defaultCenter] postNotificationName:kSettingsActionsDidCompleteNotification
-                                                                object:nil];
+            [[NSNotificationCenter defaultCenter] postNotificationName:PackageQueueDidChangeNotification object:[PackageQueue sharedQueue]];
+            [[NSNotificationCenter defaultCenter] postNotificationName:kSettingsActionsDidCompleteNotification object:nil];
         }
     });
 }
@@ -544,9 +550,7 @@ static void settings_request_all_live_loops_stop(const char *reason)
     }
 }
 
-static void settings_live_loop_sleep_interruptible(uint64_t targetUS,
-                                                 useconds_t fallbackUS,
-                                                 volatile int *stopFlag)
+static void settings_live_loop_sleep_interruptible(uint64_t targetUS, useconds_t fallbackUS, volatile int *stopFlag)
 {
     uint64_t sleptFallbackUS = 0;
     while (!settings_cleanup_in_progress() && (!stopFlag || *stopFlag == 0)) {
@@ -587,8 +591,7 @@ static UIViewController *settings_active_presenter(UIViewController *fallback)
     for (UIScene *scene in UIApplication.sharedApplication.connectedScenes) {
         if (![scene isKindOfClass:UIWindowScene.class]) continue;
         UIWindowScene *ws = (UIWindowScene *)scene;
-        if (ws.activationState != UISceneActivationStateForegroundActive &&
-            ws.activationState != UISceneActivationStateForegroundInactive) {
+        if (ws.activationState != UISceneActivationStateForegroundActive && ws.activationState != UISceneActivationStateForegroundInactive) {
             continue;
         }
         for (UIWindow *window in ws.windows) {
@@ -630,14 +633,8 @@ static NSComparisonResult settings_compare_system_version(NSString *target)
 
 BOOL settings_device_supported(void)
 {
-    BOOL ios17to18 =
-        settings_compare_system_version(@"17.0") != NSOrderedAscending &&
-        settings_compare_system_version(@"18.7.1") != NSOrderedDescending;
-
-    BOOL ios26 =
-        settings_compare_system_version(@"26.0") != NSOrderedAscending &&
-        settings_compare_system_version(@"26.0.1") != NSOrderedDescending;
-
+    BOOL ios17to18 = settings_compare_system_version(@"17.0") != NSOrderedAscending && settings_compare_system_version(@"18.7.1") != NSOrderedDescending;
+    BOOL ios26 = settings_compare_system_version(@"26.0") != NSOrderedAscending && settings_compare_system_version(@"26.0.1") != NSOrderedDescending;
     return ios17to18 || ios26;
 }
 
@@ -651,10 +648,7 @@ static void settings_progress(NSUInteger *step, NSUInteger total, const char *me
 {
     if (!step || !message) return;
     (*step)++;
-    log_user("[RUN %lu/%lu] %s\n",
-             (unsigned long)*step,
-             (unsigned long)total,
-             message);
+    log_user("[RUN %lu/%lu] %s\n", (unsigned long)*step, (unsigned long)total, message);
 }
 
 static void settings_log_run_context(void)
@@ -664,12 +658,9 @@ static void settings_log_run_context(void)
     if (uname(&u) == 0 && u.machine[0]) machine = u.machine;
 
     NSString *version = UIDevice.currentDevice.systemVersion ?: @"unknown";
-    const char *krwState = g_kexploit_done
-        ? "cached app KRW present; validating before use"
-        : "no live app KRW; recovery or fresh chain will be attempted";
+    const char *krwState = g_kexploit_done ? "cached app KRW present; validating before use" : "no live app KRW; recovery or fresh chain will be attempted";
 
-    log_user("[BOOT] Cyanide pid=%d running on %s, iOS/iPadOS %s.\n",
-             getpid(), machine, version.UTF8String);
+    log_user("[BOOT] Cyanide pid=%d running on %s, iOS/iPadOS %s.\n", getpid(), machine, version.UTF8String);
     log_user("[BOOT] Initializing settings, device support, action planner, and KRW gate.\n");
     log_user("[BOOT] KRW state: %s.\n", krwState);
 }
@@ -732,8 +723,7 @@ static void settings_destroy_springboard_remote_call_locked(const char *reason)
 {
     if (!g_springboard_rc_ready) return;
 
-    printf("[SETTINGS] destroying SpringBoard RemoteCall session%s%s\n",
-           reason ? ": " : "", reason ?: "");
+    printf("[SETTINGS] destroying SpringBoard RemoteCall session%s%s\n", reason ? ": " : "", reason ?: "");
     destroy_remote_call();
     g_springboard_rc_ready = 0;
     g_springboard_sandbox_escaped = 0;
@@ -776,9 +766,7 @@ static void settings_prepare_for_respring_sync(void)
 static void settings_terminal_kexploit_cleanup_sync_internal(const char *reason)
 {
     log_user("[CLEANUP] Stopping live sessions and cleaning local KRW state.\n");
-    printf("[SETTINGS] terminal KRW cleanup requested%s%s done=%d rcReady=%d\n",
-           reason ? ": " : "", reason ?: "",
-           g_kexploit_done, g_springboard_rc_ready);
+    printf("[SETTINGS] terminal KRW cleanup requested%s%s done=%d rcReady=%d\n", reason ? ": " : "", reason ?: "", g_kexploit_done, g_springboard_rc_ready);
     settings_request_all_live_loops_stop("terminal KRW cleanup");
     settings_end_statbar_background_task_async("terminal KRW cleanup");
 
@@ -802,8 +790,7 @@ static void settings_terminal_kexploit_cleanup_sync_internal(const char *reason)
 
     bool parked = kexploit_terminal_cleanup();
     printf("[SETTINGS] terminal KRW cleanup result parked=%d\n", parked);
-    log_user("%s Clean Up finished. Next Run will try persisted KRW recovery first.\n",
-             parked ? "[OK]" : "[WARN]");
+    log_user("%s Clean Up finished. Next Run will try persisted KRW recovery first.\n", parked ? "[OK]" : "[WARN]");
     g_kexploit_done = NO;
     g_springboard_rc_ready = 0;
     g_springboard_sandbox_escaped = 0;
@@ -823,8 +810,7 @@ static BOOL settings_acquire_actions_lock_wait(const char *owner, uint64_t timeo
 
     while (__sync_lock_test_and_set(&g_settings_actions_running, 1)) {
         if (!loggedWait) {
-            printf("[SETTINGS] %s waiting for active action before cleanup\n",
-                   owner ?: "cleanup");
+            printf("[SETTINGS] %s waiting for active action before cleanup\n", owner ?: "cleanup");
             log_user("[CLEANUP] Current operation is active; cleanup is queued.\n");
             loggedWait = YES;
         }
@@ -832,8 +818,7 @@ static BOOL settings_acquire_actions_lock_wait(const char *owner, uint64_t timeo
         if (timeoutUS != 0) {
             uint64_t nowUS = settings_now_us();
             if (startUS != 0 && nowUS >= startUS && nowUS - startUS >= timeoutUS) {
-                printf("[SETTINGS] %s timed out waiting for action lock\n",
-                       owner ?: "cleanup");
+                printf("[SETTINGS] %s timed out waiting for action lock\n", owner ?: "cleanup");
                 log_user("[CLEANUP] Timed out waiting for the current operation to finish.\n");
                 return NO;
             }
@@ -845,8 +830,7 @@ static BOOL settings_acquire_actions_lock_wait(const char *owner, uint64_t timeo
     if (loggedWait) {
         uint64_t nowUS = settings_now_us();
         uint64_t waitedUS = (startUS != 0 && nowUS >= startUS) ? nowUS - startUS : 0;
-        printf("[SETTINGS] %s acquired action lock after %lluus\n",
-               owner ?: "cleanup", waitedUS);
+        printf("[SETTINGS] %s acquired action lock after %lluus\n", owner ?: "cleanup", waitedUS);
     }
     return YES;
 }
@@ -854,8 +838,7 @@ static BOOL settings_acquire_actions_lock_wait(const char *owner, uint64_t timeo
 static void settings_queue_terminal_kexploit_cleanup(const char *reason)
 {
     if (__sync_lock_test_and_set(&g_settings_cleanup_running, 1)) {
-        printf("[SETTINGS] terminal cleanup already queued/running%s%s\n",
-               reason ? ": " : "", reason ?: "");
+        printf("[SETTINGS] terminal cleanup already queued/running%s%s\n", reason ? ": " : "", reason ?: "");
         log_user("[CLEANUP] Clean Up is already queued.\n");
         return;
     }
@@ -877,8 +860,7 @@ static void settings_queue_terminal_kexploit_cleanup(const char *reason)
 void settings_best_effort_termination_cleanup(const char *reason)
 {
     if (__sync_lock_test_and_set(&g_settings_termination_cleanup_started, 1)) {
-        printf("[SETTINGS] termination cleanup already attempted%s%s\n",
-               reason ? ": " : "", reason ?: "");
+        printf("[SETTINGS] termination cleanup already attempted%s%s\n", reason ? ": " : "", reason ?: "");
         return;
     }
 
@@ -927,8 +909,7 @@ void settings_destroy_springboard_remote_call(void)
                 rssidisplay_stop_in_session();
             }
             settings_destroy_springboard_remote_call_locked("manual cleanup");
-            log_user(hadSession ? "[OK] SpringBoard session disconnected.\n" :
-                                  "[SESSION] No active SpringBoard session.\n");
+            log_user(hadSession ? "[OK] SpringBoard session disconnected.\n" : "[SESSION] No active SpringBoard session.\n");
         }
     });
 }
@@ -945,22 +926,14 @@ static bool settings_apply_sbc_from_defaults_locked(NSUserDefaults *d)
 
 static BOOL settings_dark_tweaks_any_enabled(NSUserDefaults *d)
 {
-    return [d boolForKey:kSettingsDSDisableAppLibrary] ||
-           [d boolForKey:kSettingsDSDisableIconFlyIn] ||
-           [d boolForKey:kSettingsDSZeroWakeAnimation] ||
-           [d boolForKey:kSettingsDSZeroBacklightFade] ||
-           [d boolForKey:kSettingsDSDoubleTapToLock];
+    return [d boolForKey:kSettingsDSDisableAppLibrary] || [d boolForKey:kSettingsDSDisableIconFlyIn] || [d boolForKey:kSettingsDSZeroWakeAnimation] || [d boolForKey:kSettingsDSZeroBacklightFade] || [d boolForKey:kSettingsDSDoubleTapToLock];
 }
 
 static bool settings_apply_dark_tweaks_from_defaults_locked(NSUserDefaults *d)
 {
     if (!settings_dark_tweaks_any_enabled(d)) return false;
 
-    return darksword_tweaks_apply_in_session([d boolForKey:kSettingsDSDisableAppLibrary],
-                                             [d boolForKey:kSettingsDSDisableIconFlyIn],
-                                             [d boolForKey:kSettingsDSZeroWakeAnimation],
-                                             [d boolForKey:kSettingsDSZeroBacklightFade],
-                                             [d boolForKey:kSettingsDSDoubleTapToLock]);
+    return darksword_tweaks_apply_in_session([d boolForKey:kSettingsDSDisableAppLibrary], [d boolForKey:kSettingsDSDisableIconFlyIn], [d boolForKey:kSettingsDSZeroWakeAnimation], [d boolForKey:kSettingsDSZeroBacklightFade], [d boolForKey:kSettingsDSDoubleTapToLock]);
 }
 
 static void settings_reset_sbc_defaults(void)
@@ -978,12 +951,7 @@ static void settings_reset_sbc_defaults(void)
     [d setBool:kSBCDefaultHideLabels forKey:kSettingsSBCHideLabels];
     [d synchronize];
 
-    printf("[SETTINGS] SBC reset defaults dock=%ld hs=%ldx%ld hideLabels=%d rcReady=%d\n",
-           (long)kSBCDefaultDockIcons,
-           (long)kSBCDefaultCols,
-           (long)kSBCDefaultRows,
-           kSBCDefaultHideLabels,
-           g_springboard_rc_ready);
+    printf("[SETTINGS] SBC reset defaults dock=%ld hs=%ldx%ld hideLabels=%d rcReady=%d\n", (long)kSBCDefaultDockIcons, (long)kSBCDefaultCols, (long)kSBCDefaultRows, kSBCDefaultHideLabels, g_springboard_rc_ready);
 
     if (!g_springboard_rc_ready) return;
 
@@ -991,8 +959,7 @@ static void settings_reset_sbc_defaults(void)
         @synchronized (settings_rc_lock()) {
             if (!g_springboard_rc_ready) return;
             bool ok = settings_apply_sbc_from_defaults_locked(d);
-            settings_mark_tweak_applied(kSettingsSBCEnabled,
-                                        ok && [d boolForKey:kSettingsSBCEnabled]);
+            settings_mark_tweak_applied(kSettingsSBCEnabled, ok && [d boolForKey:kSettingsSBCEnabled]);
             printf("[SETTINGS] SBC reset apply result=%d\n", ok);
         }
         settings_notify_package_queue_changed_async();
@@ -1022,13 +989,10 @@ static void settings_run_ota_action(BOOL disable)
                     axonlite_stop_in_session();
                     rssidisplay_stop_in_session();
                 }
-                settings_destroy_springboard_remote_call_locked(disable ? "switching to launchd for OTA disable" :
-                                                                         "switching to launchd for OTA enable");
+                settings_destroy_springboard_remote_call_locked(disable ? "switching to launchd for OTA disable" : "switching to launchd for OTA enable");
                 bool ok = darksword_ota_set_disabled(disable);
                 printf("[SETTINGS] OTA %s result=%d\n", disable ? "disable" : "enable", ok);
-                log_user("%s OTA updates %s. Reboot or userspace restart is still required.\n",
-                         ok ? "[OK]" : "[WARN]",
-                         disable ? "disabled" : "enabled");
+                log_user("%s OTA updates %s. Reboot or userspace restart is still required.\n", ok ? "[OK]" : "[WARN]", disable ? "disabled" : "enabled");
             }
         } @finally {
             __sync_lock_release(&g_settings_actions_running);
@@ -1045,8 +1009,6 @@ static void settings_start_statbar_live_loop(void)
     if (![d boolForKey:kSettingsStatBarEnabled]) return;
 
     if (__sync_lock_test_and_set(&g_statbar_live_running, 1)) {
-        // Log-once for the process lifetime; further "already running" hits
-        // during foreground/background lifecycle churn are pure noise.
         static volatile int loggedAlready = 0;
         if (__sync_bool_compare_and_swap(&loggedAlready, 0, 1)) {
             printf("[SETTINGS] StatBar live loop already running\n");
@@ -1066,26 +1028,17 @@ static void settings_start_statbar_live_loop(void)
         uint64_t nextTickUS = settings_now_us();
         BOOL pausedForSleep = NO;
 
-        printf("[SETTINGS] StatBar live loop started interval=%uus background=%uus max=%lu\n",
-               kStatBarLiveIntervalUS,
-               kStatBarLiveBackgroundIntervalUS,
-               (unsigned long)kStatBarLiveMaxTicks);
+        printf("[SETTINGS] StatBar live loop started interval=%uus background=%uus max=%lu\n", kStatBarLiveIntervalUS, kStatBarLiveBackgroundIntervalUS, (unsigned long)kStatBarLiveMaxTicks);
 
         @try {
-            while ([d boolForKey:kSettingsStatBarEnabled] &&
-                   !settings_cleanup_in_progress() &&
-                   !g_statbar_live_stop_requested &&
-                   tick < kStatBarLiveMaxTicks) {
-                useconds_t intervalUS = settings_live_interval(kStatBarLiveIntervalUS,
-                                                               kStatBarLiveBackgroundIntervalUS);
+            while ([d boolForKey:kSettingsStatBarEnabled] && !settings_cleanup_in_progress() && !g_statbar_live_stop_requested && tick < kStatBarLiveMaxTicks) {
+                useconds_t intervalUS = settings_live_interval(kStatBarLiveIntervalUS, kStatBarLiveBackgroundIntervalUS);
                 if (!settings_statbar_screen_awake()) {
                     if (!pausedForSleep) {
                         pausedForSleep = YES;
                         printf("[SETTINGS] StatBar paused while screen is asleep\n");
                     }
-                    settings_live_loop_sleep_interruptible(0,
-                                                           intervalUS,
-                                                           &g_statbar_live_stop_requested);
+                    settings_live_loop_sleep_interruptible(0, intervalUS, &g_statbar_live_stop_requested);
                     nextTickUS = settings_now_us();
                     continue;
                 }
@@ -1103,8 +1056,7 @@ static void settings_start_statbar_live_loop(void)
                         failures++;
                         break;
                     }
-                    ok = statbar_apply_in_session([d boolForKey:kSettingsStatBarCelsius],
-                                                  [d boolForKey:kSettingsStatBarHideNet]);
+                    ok = statbar_apply_in_session([d boolForKey:kSettingsStatBarCelsius], [d boolForKey:kSettingsStatBarHideNet]);
                 }
 
                 if (tick == 0) printf("[SETTINGS] StatBar result=%d\n", ok);
@@ -1112,58 +1064,37 @@ static void settings_start_statbar_live_loop(void)
                     failures = 0;
                 } else {
                     failures++;
-                    printf("[SETTINGS] StatBar tick failed tick=%lu failures=%lu\n",
-                           (unsigned long)tick, (unsigned long)failures);
+                    printf("[SETTINGS] StatBar tick failed tick=%lu failures=%lu\n", (unsigned long)tick, (unsigned long)failures);
                     if (failures >= settings_live_failure_limit(3)) break;
                 }
 
                 tick++;
-                if (![d boolForKey:kSettingsStatBarEnabled] ||
-                    g_statbar_live_stop_requested ||
-                    tick >= kStatBarLiveMaxTicks) break;
+                if (![d boolForKey:kSettingsStatBarEnabled] || g_statbar_live_stop_requested || tick >= kStatBarLiveMaxTicks) break;
 
                 uint64_t nowUS = settings_now_us();
                 uint64_t elapsedUS = (tickStartUS != 0 && nowUS >= tickStartUS) ? (nowUS - tickStartUS) : 0;
                 if (nextTickUS != 0) {
-                    intervalUS = settings_live_interval(kStatBarLiveIntervalUS,
-                                                        kStatBarLiveBackgroundIntervalUS);
+                    intervalUS = settings_live_interval(kStatBarLiveIntervalUS, kStatBarLiveBackgroundIntervalUS);
                     nextTickUS += intervalUS;
                     if (nowUS < nextTickUS) {
                         uint64_t sleepUS = nextTickUS - nowUS;
                         if (settings_should_log_statbar_tick(tick - 1)) {
-                            printf("[SETTINGS] StatBar tick=%lu elapsed=%lluus sleep=%lluus mode=%s\n",
-                                   (unsigned long)(tick - 1),
-                                   elapsedUS,
-                                   sleepUS,
-                                   settings_live_context());
+                            printf("[SETTINGS] StatBar tick=%lu elapsed=%lluus sleep=%lluus mode=%s\n", (unsigned long)(tick - 1), elapsedUS, sleepUS, settings_live_context());
                         }
-                        settings_live_loop_sleep_interruptible(nextTickUS,
-                                                               (useconds_t)sleepUS,
-                                                               &g_statbar_live_stop_requested);
+                        settings_live_loop_sleep_interruptible(nextTickUS, (useconds_t)sleepUS, &g_statbar_live_stop_requested);
                     } else {
                         uint64_t overrunUS = nowUS - nextTickUS;
                         if (settings_should_log_statbar_tick(tick - 1)) {
-                            printf("[SETTINGS] StatBar tick=%lu elapsed=%lluus overrun=%lluus mode=%s\n",
-                                   (unsigned long)(tick - 1),
-                                   elapsedUS,
-                                   overrunUS,
-                                   settings_live_context());
+                            printf("[SETTINGS] StatBar tick=%lu elapsed=%lluus overrun=%lluus mode=%s\n", (unsigned long)(tick - 1), elapsedUS, overrunUS, settings_live_context());
                         }
                         nextTickUS = nowUS;
                     }
                 } else {
-                    settings_live_loop_sleep_interruptible(0,
-                                                           settings_live_interval(kStatBarLiveIntervalUS,
-                                                                                  kStatBarLiveBackgroundIntervalUS),
-                                                           &g_statbar_live_stop_requested);
+                    settings_live_loop_sleep_interruptible(0, settings_live_interval(kStatBarLiveIntervalUS, kStatBarLiveBackgroundIntervalUS), &g_statbar_live_stop_requested);
                 }
             }
         } @finally {
-            printf("[SETTINGS] StatBar live loop exited ticks=%lu enabled=%d failures=%lu stop=%d\n",
-                   (unsigned long)tick,
-                   [d boolForKey:kSettingsStatBarEnabled],
-                   (unsigned long)failures,
-                   g_statbar_live_stop_requested);
+            printf("[SETTINGS] StatBar live loop exited ticks=%lu enabled=%d failures=%lu stop=%d\n", (unsigned long)tick, [d boolForKey:kSettingsStatBarEnabled], (unsigned long)failures, g_statbar_live_stop_requested);
             if (![d boolForKey:kSettingsStatBarEnabled] || g_statbar_live_stop_requested || failures > 0) {
                 settings_end_statbar_background_task_async("live loop exited");
             }
@@ -1186,26 +1117,19 @@ static void settings_apply_statbar_once_async(const char *reason)
         bool ok = false;
         (void)settings_refresh_screen_awake_state(reason ?: "statbar apply");
         if (!settings_screen_awake_cached()) {
-            printf("[SETTINGS] StatBar lifecycle apply%s%s skipped: screen asleep\n",
-                   reason ? ": " : "", reason ?: "");
+            printf("[SETTINGS] StatBar lifecycle apply%s%s skipped: screen asleep\n", reason ? ": " : "", reason ?: "");
             settings_start_statbar_live_loop();
             return;
         }
         @synchronized (settings_rc_lock()) {
-            if (settings_cleanup_in_progress() ||
-                ![d boolForKey:kSettingsStatBarEnabled] ||
-                !g_springboard_rc_ready) return;
-            ok = statbar_apply_in_session([d boolForKey:kSettingsStatBarCelsius],
-                                          [d boolForKey:kSettingsStatBarHideNet]);
+            if (settings_cleanup_in_progress() || ![d boolForKey:kSettingsStatBarEnabled] || !g_springboard_rc_ready) return;
+            ok = statbar_apply_in_session([d boolForKey:kSettingsStatBarCelsius], [d boolForKey:kSettingsStatBarHideNet]);
         }
-        // Only log lifecycle applies that change result; a clean success on
-        // every foreground/background flip is noise.
         static volatile int lastResult = -1;
         int now = ok ? 1 : 0;
         if (now != lastResult) {
             lastResult = now;
-            printf("[SETTINGS] StatBar lifecycle apply%s%s result=%d\n",
-                   reason ? ": " : "", reason ?: "", ok);
+            printf("[SETTINGS] StatBar lifecycle apply%s%s result=%d\n", reason ? ": " : "", reason ?: "", ok);
         }
         settings_start_statbar_live_loop();
     });
@@ -1241,26 +1165,17 @@ static void settings_start_rssi_live_loop(void)
         uint64_t nextTickUS = settings_now_us();
         BOOL pausedForSleep = NO;
 
-        printf("[SETTINGS] RSSI live loop started interval=%uus background=%uus max=%lu\n",
-               kRSSILiveIntervalUS,
-               kRSSILiveBackgroundIntervalUS,
-               (unsigned long)kRSSILiveMaxTicks);
+        printf("[SETTINGS] RSSI live loop started interval=%uus background=%uus max=%lu\n", kRSSILiveIntervalUS, kRSSILiveBackgroundIntervalUS, (unsigned long)kRSSILiveMaxTicks);
 
         @try {
-            while ([d boolForKey:kSettingsRSSIDisplayEnabled] &&
-                   !settings_cleanup_in_progress() &&
-                   !g_rssi_live_stop_requested &&
-                   tick < kRSSILiveMaxTicks) {
-                useconds_t intervalUS = settings_live_interval(kRSSILiveIntervalUS,
-                                                               kRSSILiveBackgroundIntervalUS);
+            while ([d boolForKey:kSettingsRSSIDisplayEnabled] && !settings_cleanup_in_progress() && !g_rssi_live_stop_requested && tick < kRSSILiveMaxTicks) {
+                useconds_t intervalUS = settings_live_interval(kRSSILiveIntervalUS, kRSSILiveBackgroundIntervalUS);
                 if (!settings_statbar_screen_awake()) {
                     if (!pausedForSleep) {
                         pausedForSleep = YES;
                         printf("[SETTINGS] RSSI paused while screen is asleep\n");
                     }
-                    settings_live_loop_sleep_interruptible(0,
-                                                           intervalUS,
-                                                           &g_rssi_live_stop_requested);
+                    settings_live_loop_sleep_interruptible(0, intervalUS, &g_rssi_live_stop_requested);
                     nextTickUS = settings_now_us();
                     continue;
                 }
@@ -1278,56 +1193,40 @@ static void settings_start_rssi_live_loop(void)
                         failures++;
                         break;
                     }
-                    ok = rssidisplay_apply_in_session([d boolForKey:kSettingsRSSIDisplayWifi],
-                                                      [d boolForKey:kSettingsRSSIDisplayCell]);
+                    ok = rssidisplay_apply_in_session([d boolForKey:kSettingsRSSIDisplayWifi], [d boolForKey:kSettingsRSSIDisplayCell]);
                 }
 
                 uint64_t tickEndUS = settings_now_us();
                 if (tick == 0) {
                     uint64_t elapsedUS = tickEndUS >= tickStartUS ? tickEndUS - tickStartUS : 0;
-                    printf("[SETTINGS] RSSI first tick result=%d elapsed=%lluus\n",
-                           ok,
-                           (unsigned long long)elapsedUS);
+                    printf("[SETTINGS] RSSI first tick result=%d elapsed=%lluus\n", ok, (unsigned long long)elapsedUS);
                 }
                 if (ok) {
                     failures = 0;
                 } else {
                     failures++;
-                    printf("[SETTINGS] RSSI tick failed tick=%lu failures=%lu\n",
-                           (unsigned long)tick, (unsigned long)failures);
+                    printf("[SETTINGS] RSSI tick failed tick=%lu failures=%lu\n", (unsigned long)tick, (unsigned long)failures);
                     if (failures >= settings_live_failure_limit(5)) break;
                 }
 
                 tick++;
-                if (![d boolForKey:kSettingsRSSIDisplayEnabled] ||
-                    g_rssi_live_stop_requested ||
-                    tick >= kRSSILiveMaxTicks) break;
+                if (![d boolForKey:kSettingsRSSIDisplayEnabled] || g_rssi_live_stop_requested || tick >= kRSSILiveMaxTicks) break;
 
                 uint64_t nowUS = tickEndUS;
                 if (nextTickUS != 0) {
-                    intervalUS = settings_live_interval(kRSSILiveIntervalUS,
-                                                        kRSSILiveBackgroundIntervalUS);
+                    intervalUS = settings_live_interval(kRSSILiveIntervalUS, kRSSILiveBackgroundIntervalUS);
                     nextTickUS += intervalUS;
                     if (nowUS < nextTickUS) {
-                        settings_live_loop_sleep_interruptible(nextTickUS,
-                                                               (useconds_t)(nextTickUS - nowUS),
-                                                               &g_rssi_live_stop_requested);
+                        settings_live_loop_sleep_interruptible(nextTickUS, (useconds_t)(nextTickUS - nowUS), &g_rssi_live_stop_requested);
                     } else {
                         nextTickUS = nowUS;
                     }
                 } else {
-                    settings_live_loop_sleep_interruptible(0,
-                                                           settings_live_interval(kRSSILiveIntervalUS,
-                                                                                  kRSSILiveBackgroundIntervalUS),
-                                                           &g_rssi_live_stop_requested);
+                    settings_live_loop_sleep_interruptible(0, settings_live_interval(kRSSILiveIntervalUS, kRSSILiveBackgroundIntervalUS), &g_rssi_live_stop_requested);
                 }
             }
         } @finally {
-            printf("[SETTINGS] RSSI live loop exited ticks=%lu enabled=%d failures=%lu stop=%d\n",
-                   (unsigned long)tick,
-                   [d boolForKey:kSettingsRSSIDisplayEnabled],
-                   (unsigned long)failures,
-                   g_rssi_live_stop_requested);
+            printf("[SETTINGS] RSSI live loop exited ticks=%lu enabled=%d failures=%lu stop=%d\n", (unsigned long)tick, [d boolForKey:kSettingsRSSIDisplayEnabled], (unsigned long)failures, g_rssi_live_stop_requested);
             __sync_lock_release(&g_rssi_live_running);
         }
     });
@@ -1348,20 +1247,15 @@ static void settings_apply_rssi_once_async(const char *reason)
         bool ok = false;
         (void)settings_refresh_screen_awake_state(reason ?: "rssi apply");
         if (!settings_screen_awake_cached()) {
-            printf("[SETTINGS] RSSI lifecycle apply%s%s skipped: screen asleep\n",
-                   reason ? ": " : "", reason ?: "");
+            printf("[SETTINGS] RSSI lifecycle apply%s%s skipped: screen asleep\n", reason ? ": " : "", reason ?: "");
             settings_start_rssi_live_loop();
             return;
         }
         @synchronized (settings_rc_lock()) {
-            if (settings_cleanup_in_progress() ||
-                ![d boolForKey:kSettingsRSSIDisplayEnabled] ||
-                !g_springboard_rc_ready) return;
-            ok = rssidisplay_apply_in_session([d boolForKey:kSettingsRSSIDisplayWifi],
-                                              [d boolForKey:kSettingsRSSIDisplayCell]);
+            if (settings_cleanup_in_progress() || ![d boolForKey:kSettingsRSSIDisplayEnabled] || !g_springboard_rc_ready) return;
+            ok = rssidisplay_apply_in_session([d boolForKey:kSettingsRSSIDisplayWifi], [d boolForKey:kSettingsRSSIDisplayCell]);
         }
-        printf("[SETTINGS] RSSI lifecycle apply%s%s result=%d\n",
-               reason ? ": " : "", reason ?: "", ok);
+        printf("[SETTINGS] RSSI lifecycle apply%s%s result=%d\n", reason ? ": " : "", reason ?: "", ok);
         settings_start_rssi_live_loop();
     });
 }
@@ -1395,40 +1289,23 @@ static void settings_start_axonlite_live_loop(void)
         uint64_t nextTickUS = settings_now_us();
         BOOL pausedForSleep = NO;
 
-        printf("[SETTINGS] Axon Lite live loop started interval=%uus background=%uus max=%lu\n",
-               kAxonLiteLiveIntervalUS,
-               kAxonLiteLiveBackgroundIntervalUS,
-               (unsigned long)kAxonLiteLiveMaxTicks);
+        printf("[SETTINGS] Axon Lite live loop started interval=%uus background=%uus max=%lu\n", kAxonLiteLiveIntervalUS, kAxonLiteLiveBackgroundIntervalUS, (unsigned long)kAxonLiteLiveMaxTicks);
 
         @try {
-            while ([d boolForKey:kSettingsAxonLiteEnabled] &&
-                   !settings_cleanup_in_progress() &&
-                   !g_axonlite_live_stop_requested &&
-                   tick < kAxonLiteLiveMaxTicks) {
-                useconds_t intervalUS = settings_live_interval(kAxonLiteLiveIntervalUS,
-                                                               kAxonLiteLiveBackgroundIntervalUS);
-                // While the screen is blank, SB tears down cover-sheet view
-                // controllers to free memory. Calling into our cached
-                // gAxonCLVC etc during that window risks dereferencing freed
-                // objects (the PAC-fault path we keep hitting). Pause until
-                // the screen wakes; on wake the loop re-finds CLVC fresh.
+            while ([d boolForKey:kSettingsAxonLiteEnabled] && !settings_cleanup_in_progress() && !g_axonlite_live_stop_requested && tick < kAxonLiteLiveMaxTicks) {
+                useconds_t intervalUS = settings_live_interval(kAxonLiteLiveIntervalUS, kAxonLiteLiveBackgroundIntervalUS);
                 if (!settings_statbar_screen_awake()) {
                     if (!pausedForSleep) {
                         pausedForSleep = YES;
                         printf("[SETTINGS] Axon Lite paused while screen is asleep\n");
                     }
-                    settings_live_loop_sleep_interruptible(0,
-                                                           intervalUS,
-                                                           &g_axonlite_live_stop_requested);
+                    settings_live_loop_sleep_interruptible(0, intervalUS, &g_axonlite_live_stop_requested);
                     nextTickUS = settings_now_us();
                     continue;
                 }
                 if (pausedForSleep) {
                     pausedForSleep = NO;
                     printf("[SETTINGS] Axon Lite resumed after screen wake\n");
-                    // SB likely rebuilt the cover sheet during the blank
-                    // window; the cached CLVC we held is stale. Drop it so
-                    // the next tick walks the windows again.
                     axonlite_forget_remote_state();
                 }
 
@@ -1449,33 +1326,24 @@ static void settings_start_axonlite_live_loop(void)
                     failures = 0;
                 } else {
                     failures++;
-                    printf("[SETTINGS] Axon Lite tick failed tick=%lu failures=%lu\n",
-                           (unsigned long)tick, (unsigned long)failures);
+                    printf("[SETTINGS] Axon Lite tick failed tick=%lu failures=%lu\n", (unsigned long)tick, (unsigned long)failures);
                     if (failures >= settings_live_failure_limit(3)) break;
                 }
 
                 tick++;
-                if (![d boolForKey:kSettingsAxonLiteEnabled] ||
-                    g_axonlite_live_stop_requested ||
-                    tick >= kAxonLiteLiveMaxTicks) break;
+                if (![d boolForKey:kSettingsAxonLiteEnabled] || g_axonlite_live_stop_requested || tick >= kAxonLiteLiveMaxTicks) break;
 
                 uint64_t nowUS = settings_now_us();
                 if (nextTickUS != 0) {
-                    intervalUS = settings_live_interval(kAxonLiteLiveIntervalUS,
-                                                        kAxonLiteLiveBackgroundIntervalUS);
+                    intervalUS = settings_live_interval(kAxonLiteLiveIntervalUS, kAxonLiteLiveBackgroundIntervalUS);
                     nextTickUS += intervalUS;
                     if (nowUS < nextTickUS) {
-                        settings_live_loop_sleep_interruptible(nextTickUS,
-                                                               (useconds_t)(nextTickUS - nowUS),
-                                                               &g_axonlite_live_stop_requested);
+                        settings_live_loop_sleep_interruptible(nextTickUS, (useconds_t)(nextTickUS - nowUS), &g_axonlite_live_stop_requested);
                     } else {
                         nextTickUS = nowUS;
                     }
                 } else {
-                    settings_live_loop_sleep_interruptible(0,
-                                                           settings_live_interval(kAxonLiteLiveIntervalUS,
-                                                                                  kAxonLiteLiveBackgroundIntervalUS),
-                                                           &g_axonlite_live_stop_requested);
+                    settings_live_loop_sleep_interruptible(0, settings_live_interval(kAxonLiteLiveIntervalUS, kAxonLiteLiveBackgroundIntervalUS), &g_axonlite_live_stop_requested);
                 }
 
                 uint64_t elapsedUS = tickStartUS != 0 && nowUS >= tickStartUS ? nowUS - tickStartUS : 0;
@@ -1484,11 +1352,7 @@ static void settings_start_axonlite_live_loop(void)
                 }
             }
         } @finally {
-            printf("[SETTINGS] Axon Lite live loop exited ticks=%lu enabled=%d failures=%lu stop=%d\n",
-                   (unsigned long)tick,
-                   [d boolForKey:kSettingsAxonLiteEnabled],
-                   (unsigned long)failures,
-                   g_axonlite_live_stop_requested);
+            printf("[SETTINGS] Axon Lite live loop exited ticks=%lu enabled=%d failures=%lu stop=%d\n", (unsigned long)tick, [d boolForKey:kSettingsAxonLiteEnabled], (unsigned long)failures, g_axonlite_live_stop_requested);
             __sync_lock_release(&g_axonlite_live_running);
         }
     });
@@ -1506,13 +1370,10 @@ static void settings_apply_axonlite_once_async(const char *reason)
         if (settings_cleanup_in_progress()) return;
         bool ok = false;
         @synchronized (settings_rc_lock()) {
-            if (settings_cleanup_in_progress() ||
-                ![d boolForKey:kSettingsAxonLiteEnabled] ||
-                !g_springboard_rc_ready) return;
+            if (settings_cleanup_in_progress() || ![d boolForKey:kSettingsAxonLiteEnabled] || !g_springboard_rc_ready) return;
             ok = axonlite_apply_in_session();
         }
-        printf("[SETTINGS] Axon Lite lifecycle apply%s%s result=%d\n",
-               reason ? ": " : "", reason ?: "", ok);
+        printf("[SETTINGS] Axon Lite lifecycle apply%s%s result=%d\n", reason ? ": " : "", reason ?: "", ok);
         settings_start_axonlite_live_loop();
     });
 }
@@ -1523,18 +1384,13 @@ void settings_application_did_enter_background(void)
     if (settings_cleanup_in_progress()) return;
 
     NSUserDefaults *d = [NSUserDefaults standardUserDefaults];
-    BOOL anyLiveLoopNeeded =
-        ([d boolForKey:kSettingsAxonLiteEnabled]    && g_springboard_rc_ready) ||
-        (settings_rssi_install_allowed() && [d boolForKey:kSettingsRSSIDisplayEnabled] && g_springboard_rc_ready) ||
-        ([d boolForKey:kSettingsStatBarEnabled]     && g_springboard_rc_ready);
+    BOOL anyLiveLoopNeeded = ([d boolForKey:kSettingsAxonLiteEnabled] && g_springboard_rc_ready) || (settings_rssi_install_allowed() && [d boolForKey:kSettingsRSSIDisplayEnabled] && g_springboard_rc_ready) || ([d boolForKey:kSettingsStatBarEnabled] && g_springboard_rc_ready);
     if (anyLiveLoopNeeded) {
         if ([d boolForKey:kSettingsKeepAlive]) {
             ds_keepalive_apply_enabled(YES);
         }
         settings_begin_statbar_background_task_async("entered background");
-        printf("[SETTINGS] background live-loop support keepAlive=%d bgTask=%lu\n",
-               ds_keepalive_is_running(),
-               (unsigned long)g_statbar_bg_task);
+        printf("[SETTINGS] background live-loop support keepAlive=%d bgTask=%lu\n", ds_keepalive_is_running(), (unsigned long)g_statbar_bg_task);
     }
 
     if ([d boolForKey:kSettingsAxonLiteEnabled] && g_springboard_rc_ready) {
@@ -1574,25 +1430,17 @@ void settings_application_did_become_active(void)
 
 static BOOL settings_key_is_sbc(NSString *key)
 {
-    return [key isEqualToString:kSettingsSBCEnabled] ||
-           [key isEqualToString:kSettingsSBCDockIcons] ||
-           [key isEqualToString:kSettingsSBCCols] ||
-           [key isEqualToString:kSettingsSBCRows] ||
-           [key isEqualToString:kSettingsSBCHideLabels];
+    return [key isEqualToString:kSettingsSBCEnabled] || [key isEqualToString:kSettingsSBCDockIcons] || [key isEqualToString:kSettingsSBCCols] || [key isEqualToString:kSettingsSBCRows] || [key isEqualToString:kSettingsSBCHideLabels];
 }
 
 static BOOL settings_key_is_statbar(NSString *key)
 {
-    return [key isEqualToString:kSettingsStatBarEnabled] ||
-           [key isEqualToString:kSettingsStatBarCelsius] ||
-           [key isEqualToString:kSettingsStatBarHideNet];
+    return [key isEqualToString:kSettingsStatBarEnabled] || [key isEqualToString:kSettingsStatBarCelsius] || [key isEqualToString:kSettingsStatBarHideNet];
 }
 
 static BOOL settings_key_is_rssi(NSString *key)
 {
-    return [key isEqualToString:kSettingsRSSIDisplayEnabled] ||
-           [key isEqualToString:kSettingsRSSIDisplayWifi] ||
-           [key isEqualToString:kSettingsRSSIDisplayCell];
+    return [key isEqualToString:kSettingsRSSIDisplayEnabled] || [key isEqualToString:kSettingsRSSIDisplayWifi] || [key isEqualToString:kSettingsRSSIDisplayCell];
 }
 
 static BOOL settings_key_is_axonlite(NSString *key)
@@ -1602,21 +1450,12 @@ static BOOL settings_key_is_axonlite(NSString *key)
 
 static BOOL settings_key_is_dark_tweak(NSString *key)
 {
-    return [key isEqualToString:kSettingsDSDisableAppLibrary] ||
-           [key isEqualToString:kSettingsDSDisableIconFlyIn] ||
-           [key isEqualToString:kSettingsDSZeroWakeAnimation] ||
-           [key isEqualToString:kSettingsDSZeroBacklightFade] ||
-           [key isEqualToString:kSettingsDSDoubleTapToLock];
+    return [key isEqualToString:kSettingsDSDisableAppLibrary] || [key isEqualToString:kSettingsDSDisableIconFlyIn] || [key isEqualToString:kSettingsDSZeroWakeAnimation] || [key isEqualToString:kSettingsDSZeroBacklightFade] || [key isEqualToString:kSettingsDSDoubleTapToLock];
 }
 
 static BOOL settings_key_affects_package_state(NSString *key)
 {
-    return [key isEqualToString:kSettingsSBCEnabled] ||
-           [key isEqualToString:kSettingsPowercuffEnabled] ||
-           [key isEqualToString:kSettingsStatBarEnabled] ||
-           [key isEqualToString:kSettingsRSSIDisplayEnabled] ||
-           [key isEqualToString:kSettingsAxonLiteEnabled] ||
-           settings_key_is_dark_tweak(key);
+    return [key isEqualToString:kSettingsSBCEnabled] || [key isEqualToString:kSettingsPowercuffEnabled] || [key isEqualToString:kSettingsStatBarEnabled] || [key isEqualToString:kSettingsRSSIDisplayEnabled] || [key isEqualToString:kSettingsAxonLiteEnabled] || settings_key_is_dark_tweak(key);
 }
 
 static void settings_schedule_live_apply_for_key(NSString *key)
@@ -1627,8 +1466,7 @@ static void settings_schedule_live_apply_for_key(NSString *key)
     }
 
     if (!settings_device_supported()) {
-        printf("[SETTINGS] live apply blocked for %s: %s\n",
-               key.UTF8String, settings_unsupported_message().UTF8String);
+        printf("[SETTINGS] live apply blocked for %s: %s\n", key.UTF8String, settings_unsupported_message().UTF8String);
         return;
     }
 
@@ -1640,8 +1478,7 @@ static void settings_schedule_live_apply_for_key(NSString *key)
                 @synchronized (settings_rc_lock()) {
                     if (settings_cleanup_in_progress() || !g_springboard_rc_ready) return;
                     bool ok = axonlite_apply_in_session();
-                    settings_mark_tweak_applied(kSettingsAxonLiteEnabled,
-                                                ok && [d boolForKey:kSettingsAxonLiteEnabled]);
+                    settings_mark_tweak_applied(kSettingsAxonLiteEnabled, ok && [d boolForKey:kSettingsAxonLiteEnabled]);
                     printf("[SETTINGS] live Axon Lite apply result=%d\n", ok);
                 }
                 settings_start_axonlite_live_loop();
@@ -1667,10 +1504,8 @@ static void settings_schedule_live_apply_for_key(NSString *key)
             dispatch_async(dispatch_get_global_queue(0, 0), ^{
                 @synchronized (settings_rc_lock()) {
                     if (settings_cleanup_in_progress() || !g_springboard_rc_ready) return;
-                    bool ok = statbar_apply_in_session([d boolForKey:kSettingsStatBarCelsius],
-                                                       [d boolForKey:kSettingsStatBarHideNet]);
-                    settings_mark_tweak_applied(kSettingsStatBarEnabled,
-                                                ok && [d boolForKey:kSettingsStatBarEnabled]);
+                    bool ok = statbar_apply_in_session([d boolForKey:kSettingsStatBarCelsius], [d boolForKey:kSettingsStatBarHideNet]);
+                    settings_mark_tweak_applied(kSettingsStatBarEnabled, ok && [d boolForKey:kSettingsStatBarEnabled]);
                     printf("[SETTINGS] live StatBar apply result=%d\n", ok);
                 }
                 settings_start_statbar_live_loop();
@@ -1713,10 +1548,8 @@ static void settings_schedule_live_apply_for_key(NSString *key)
             dispatch_async(dispatch_get_global_queue(0, 0), ^{
                 @synchronized (settings_rc_lock()) {
                     if (settings_cleanup_in_progress() || !g_springboard_rc_ready) return;
-                    bool ok = rssidisplay_apply_in_session([d boolForKey:kSettingsRSSIDisplayWifi],
-                                                           [d boolForKey:kSettingsRSSIDisplayCell]);
-                    settings_mark_tweak_applied(kSettingsRSSIDisplayEnabled,
-                                                ok && [d boolForKey:kSettingsRSSIDisplayEnabled]);
+                    bool ok = rssidisplay_apply_in_session([d boolForKey:kSettingsRSSIDisplayWifi], [d boolForKey:kSettingsRSSIDisplayCell]);
+                    settings_mark_tweak_applied(kSettingsRSSIDisplayEnabled, ok && [d boolForKey:kSettingsRSSIDisplayEnabled]);
                     printf("[SETTINGS] live RSSI apply result=%d\n", ok);
                 }
                 settings_start_rssi_live_loop();
@@ -1743,13 +1576,7 @@ static void settings_schedule_live_apply_for_key(NSString *key)
             @synchronized (settings_rc_lock()) {
                 if (settings_cleanup_in_progress() || !g_springboard_rc_ready) return;
                 bool ok = settings_apply_dark_tweaks_from_defaults_locked(d);
-                for (NSString *darkKey in @[
-                    kSettingsDSDisableAppLibrary,
-                    kSettingsDSDisableIconFlyIn,
-                    kSettingsDSZeroWakeAnimation,
-                    kSettingsDSZeroBacklightFade,
-                    kSettingsDSDoubleTapToLock,
-                ]) {
+                for (NSString *darkKey in @[ kSettingsDSDisableAppLibrary, kSettingsDSDisableIconFlyIn, kSettingsDSZeroWakeAnimation, kSettingsDSZeroBacklightFade, kSettingsDSDoubleTapToLock ]) {
                     if ([d boolForKey:darkKey]) settings_mark_tweak_applied(darkKey, ok);
                 }
                 printf("[SETTINGS] live DarkSword tweaks apply result=%d\n", ok);
@@ -1762,16 +1589,14 @@ static void settings_schedule_live_apply_for_key(NSString *key)
     if (!settings_key_is_sbc(key) || !g_springboard_rc_ready) return;
 
     uint64_t generation = __sync_add_and_fetch(&g_sbc_live_apply_generation, 1);
-    dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(250 * NSEC_PER_MSEC)),
-                   dispatch_get_global_queue(0, 0), ^{
+    dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(250 * NSEC_PER_MSEC)), dispatch_get_global_queue(0, 0), ^{
         if (generation != g_sbc_live_apply_generation) return;
         if (settings_cleanup_in_progress()) return;
 
         @synchronized (settings_rc_lock()) {
             if (settings_cleanup_in_progress() || !g_springboard_rc_ready) return;
             bool ok = settings_apply_sbc_from_defaults_locked(d);
-            settings_mark_tweak_applied(kSettingsSBCEnabled,
-                                        ok && [d boolForKey:kSettingsSBCEnabled]);
+            settings_mark_tweak_applied(kSettingsSBCEnabled, ok && [d boolForKey:kSettingsSBCEnabled]);
             printf("[SETTINGS] live SBC apply result=%d\n", ok);
         }
         settings_notify_package_queue_changed_async();
@@ -1812,8 +1637,6 @@ void settings_register_defaults(void)
 
         kSettingsAxonLiteEnabled: @NO,
     }];
-    // Signal Readouts is temporarily blocked from installation because its
-    // live RemoteCall refresh still interferes with other SpringBoard tweaks.
     if ([defaults boolForKey:kSettingsRSSIDisplayEnabled]) {
         [defaults setBool:NO forKey:kSettingsRSSIDisplayEnabled];
         [defaults synchronize];
@@ -1863,31 +1686,15 @@ void settings_run_actions(void)
 
             settings_log_run_context();
             log_user("[RUN] Verbose trace active; raw debug stream is mirrored into the app log.\n");
-            log_user("[PLAN] stages=%lu springboard=%s sbc=%s dark=%s statbar=%s rssi=%s axon=%s power=%s\n",
-                     (unsigned long)total,
-                     needsSpringBoard ? "yes" : "no",
-                     runSBC ? "yes" : "no",
-                     runDarkTweaks ? "yes" : "no",
-                     runStatBar ? "yes" : "no",
-                     runRSSI ? "yes" : "no",
-                     runAxonLite ? "yes" : "no",
-                     runPowercuff ? "yes" : "no");
+            log_user("[PLAN] stages=%lu springboard=%s sbc=%s dark=%s statbar=%s rssi=%s axon=%s power=%s\n", (unsigned long)total, needsSpringBoard ? "yes" : "no", runSBC ? "yes" : "no", runDarkTweaks ? "yes" : "no", runStatBar ? "yes" : "no", runRSSI ? "yes" : "no", runAxonLite ? "yes" : "no", runPowercuff ? "yes" : "no");
             if (runSBC) {
-                log_user("[PLAN] Home layout target: dock=%ld home=%ldx%ld labels=%s\n",
-                         (long)[d integerForKey:kSettingsSBCDockIcons],
-                         (long)[d integerForKey:kSettingsSBCCols],
-                         (long)[d integerForKey:kSettingsSBCRows],
-                         [d boolForKey:kSettingsSBCHideLabels] ? "hidden" : "shown");
+                log_user("[PLAN] Home layout target: dock=%ld home=%ldx%ld labels=%s\n", (long)[d integerForKey:kSettingsSBCDockIcons], (long)[d integerForKey:kSettingsSBCCols], (long)[d integerForKey:kSettingsSBCRows], [d boolForKey:kSettingsSBCHideLabels] ? "hidden" : "shown");
             }
             if (runStatBar) {
-                log_user("[PLAN] StatBar target: temp=%s network=%s refresh=1s\n",
-                         [d boolForKey:kSettingsStatBarCelsius] ? "C" : "F",
-                         [d boolForKey:kSettingsStatBarHideNet] ? "hidden" : "shown");
+                log_user("[PLAN] StatBar target: temp=%s network=%s refresh=1s\n", [d boolForKey:kSettingsStatBarCelsius] ? "C" : "F", [d boolForKey:kSettingsStatBarHideNet] ? "hidden" : "shown");
             }
             if (runRSSI) {
-                log_user("[PLAN] RSSI display target: wifi=%s cell=%s refresh=1s\n",
-                         [d boolForKey:kSettingsRSSIDisplayWifi] ? "on" : "off",
-                         [d boolForKey:kSettingsRSSIDisplayCell] ? "on" : "off");
+                log_user("[PLAN] RSSI display target: wifi=%s cell=%s refresh=1s\n", [d boolForKey:kSettingsRSSIDisplayWifi] ? "on" : "off", [d boolForKey:kSettingsRSSIDisplayCell] ? "on" : "off");
             }
             if (runAxonLite) {
                 log_user("[PLAN] Axon Lite target: segmented notification hub refresh=1.2s\n");
@@ -1909,25 +1716,7 @@ void settings_run_actions(void)
                 escape_sbx_demo3();
                 log_user("[OK] Sandbox-extension patch stage finished.\n");
             }
-            printf("[SETTINGS] actions escape=%d patch=%d sbc=%d dock=%ld hs=%ldx%ld hideLabels=%d dark=%d power=%d level=%s statbar=%d celsius=%d hideNet=%d rssi=%d rssiWifi=%d rssiCell=%d axon=%d rcReady=%d\n",
-                   runSandboxEscape,
-                   patchSandboxExt,
-                   runSBC,
-                   (long)[d integerForKey:kSettingsSBCDockIcons],
-                   (long)[d integerForKey:kSettingsSBCCols],
-                   (long)[d integerForKey:kSettingsSBCRows],
-                   [d boolForKey:kSettingsSBCHideLabels],
-                   runDarkTweaks,
-                   runPowercuff,
-                   ([d stringForKey:kSettingsPowercuffLevel] ?: @"").UTF8String,
-                   runStatBar,
-                   [d boolForKey:kSettingsStatBarCelsius],
-                   [d boolForKey:kSettingsStatBarHideNet],
-                   runRSSI,
-                   [d boolForKey:kSettingsRSSIDisplayWifi],
-                   [d boolForKey:kSettingsRSSIDisplayCell],
-                   runAxonLite,
-                   g_springboard_rc_ready);
+            printf("[SETTINGS] actions escape=%d patch=%d sbc=%d dock=%ld hs=%ldx%ld hideLabels=%d dark=%d power=%d level=%s statbar=%d celsius=%d hideNet=%d rssi=%d rssiWifi=%d rssiCell=%d axon=%d rcReady=%d\n", runSandboxEscape, patchSandboxExt, runSBC, (long)[d integerForKey:kSettingsSBCDockIcons], (long)[d integerForKey:kSettingsSBCCols], (long)[d integerForKey:kSettingsSBCRows], [d boolForKey:kSettingsSBCHideLabels], runDarkTweaks, runPowercuff, ([d stringForKey:kSettingsPowercuffLevel] ?: @"").UTF8String, runStatBar, [d boolForKey:kSettingsStatBarCelsius], [d boolForKey:kSettingsStatBarHideNet], runRSSI, [d boolForKey:kSettingsRSSIDisplayWifi], [d boolForKey:kSettingsRSSIDisplayCell], runAxonLite, g_springboard_rc_ready);
 
             if (runPowercuff) {
                 settings_progress(&step, total, "Applying Powercuff via thermalmonitord");
@@ -1939,11 +1728,9 @@ void settings_run_actions(void)
                     settings_destroy_springboard_remote_call_locked("switching to thermalmonitord");
                     NSString *lvl = [d stringForKey:kSettingsPowercuffLevel] ?: @"heavy";
                     bool ok = powercuff_apply(lvl.UTF8String);
-                    settings_mark_tweak_applied(kSettingsPowercuffEnabled,
-                                                ok && [d boolForKey:kSettingsPowercuffEnabled]);
-                    log_user("%s Powercuff %s through thermalmonitord.\n",
-                             ok ? "[OK]" : "[WARN]",
-                             ok ? "applied" : "did not apply cleanly");
+                    settings_parent_cleanup();
+                    settings_mark_tweak_applied(kSettingsPowercuffEnabled, ok && [d boolForKey:kSettingsPowercuffEnabled]);
+                    log_user("%s Powercuff %s through thermalmonitord.\n", ok ? "[OK]" : "[WARN]", ok ? "applied" : "did not apply cleanly");
                 }
             }
 
@@ -1961,9 +1748,7 @@ void settings_run_actions(void)
                         int sbx = escape_sbx_demo2_in_session();
                         g_springboard_sandbox_escaped = (sbx == 0);
                         printf("[SETTINGS] sandbox escape in session result=%d\n", sbx);
-                        log_user("%s SpringBoard filesystem token %s.\n",
-                                 sbx == 0 ? "[OK]" : "[WARN]",
-                                 sbx == 0 ? "consumed" : "returned a warning");
+                        log_user("%s SpringBoard filesystem token %s.\n", sbx == 0 ? "[OK]" : "[WARN]", sbx == 0 ? "consumed" : "returned a warning");
                     } else if (runSandboxEscape) {
                         printf("[SETTINGS] sandbox escape already consumed for this SpringBoard session\n");
                         settings_progress(&step, total, "Reusing SpringBoard sandbox token");
@@ -1973,78 +1758,48 @@ void settings_run_actions(void)
                     if (runSBC) {
                         settings_progress(&step, total, "Applying icon layout caches");
                         bool ok = settings_apply_sbc_from_defaults_locked(d);
-                        settings_mark_tweak_applied(kSettingsSBCEnabled,
-                                                    ok && [d boolForKey:kSettingsSBCEnabled]);
+                        settings_mark_tweak_applied(kSettingsSBCEnabled, ok && [d boolForKey:kSettingsSBCEnabled]);
                         printf("[SETTINGS] SBC result=%d\n", ok);
-                        log_user("%s Home screen layout %s; dock=%ld home=%ldx%ld.\n",
-                                 ok ? "[OK]" : "[WARN]",
-                                 ok ? "applied" : "may need a refresh",
-                                 (long)[d integerForKey:kSettingsSBCDockIcons],
-                                 (long)[d integerForKey:kSettingsSBCCols],
-                                 (long)[d integerForKey:kSettingsSBCRows]);
+                        log_user("%s Home screen layout %s; dock=%ld home=%ldx%ld.\n", ok ? "[OK]" : "[WARN]", ok ? "applied" : "may need a refresh", (long)[d integerForKey:kSettingsSBCDockIcons], (long)[d integerForKey:kSettingsSBCCols], (long)[d integerForKey:kSettingsSBCRows]);
                     }
 
                     if (runDarkTweaks) {
                         settings_progress(&step, total, "Applying DarkSword runtime hooks");
                         bool ok = settings_apply_dark_tweaks_from_defaults_locked(d);
-                        for (NSString *key in @[
-                            kSettingsDSDisableAppLibrary,
-                            kSettingsDSDisableIconFlyIn,
-                            kSettingsDSZeroWakeAnimation,
-                            kSettingsDSZeroBacklightFade,
-                            kSettingsDSDoubleTapToLock,
-                        ]) {
+                        for (NSString *key in @[ kSettingsDSDisableAppLibrary, kSettingsDSDisableIconFlyIn, kSettingsDSZeroWakeAnimation, kSettingsDSZeroBacklightFade, kSettingsDSDoubleTapToLock ]) {
                             if ([d boolForKey:key]) settings_mark_tweak_applied(key, ok);
                         }
                         printf("[SETTINGS] DarkSword tweaks result=%d\n", ok);
-                        log_user("%s DarkSword hooks %s.\n",
-                                 ok ? "[OK]" : "[WARN]",
-                                 ok ? "applied" : "may need a refresh");
+                        log_user("%s DarkSword hooks %s.\n", ok ? "[OK]" : "[WARN]", ok ? "applied" : "may need a refresh");
                     }
 
                     if (runStatBar) {
                         settings_progress(&step, total, "Starting StatBar overlay and 1s feed");
-                        bool ok = statbar_apply_in_session([d boolForKey:kSettingsStatBarCelsius],
-                                                           [d boolForKey:kSettingsStatBarHideNet]);
-                        settings_mark_tweak_applied(kSettingsStatBarEnabled,
-                                                    ok && [d boolForKey:kSettingsStatBarEnabled]);
+                        bool ok = statbar_apply_in_session([d boolForKey:kSettingsStatBarCelsius], [d boolForKey:kSettingsStatBarHideNet]);
+                        settings_mark_tweak_applied(kSettingsStatBarEnabled, ok && [d boolForKey:kSettingsStatBarEnabled]);
                         printf("[SETTINGS] StatBar result=%d\n", ok);
-                        log_user("%s StatBar %s.\n",
-                                 ok ? "[OK]" : "[WARN]",
-                                 ok ? "receiving live data" : "did not start cleanly");
+                        log_user("%s StatBar %s.\n", ok ? "[OK]" : "[WARN]", ok ? "receiving live data" : "did not start cleanly");
                     }
 
                     if (runRSSI) {
                         settings_progress(&step, total, "Starting RSSI dBm signal overlays");
-                        bool ok = rssidisplay_apply_in_session([d boolForKey:kSettingsRSSIDisplayWifi],
-                                                               [d boolForKey:kSettingsRSSIDisplayCell]);
-                        settings_mark_tweak_applied(kSettingsRSSIDisplayEnabled,
-                                                    ok && [d boolForKey:kSettingsRSSIDisplayEnabled]);
+                        bool ok = rssidisplay_apply_in_session([d boolForKey:kSettingsRSSIDisplayWifi], [d boolForKey:kSettingsRSSIDisplayCell]);
+                        settings_mark_tweak_applied(kSettingsRSSIDisplayEnabled, ok && [d boolForKey:kSettingsRSSIDisplayEnabled]);
                         printf("[SETTINGS] RSSI result=%d\n", ok);
-                        log_user("%s RSSI signal overlays %s.\n",
-                                 ok ? "[OK]" : "[WARN]",
-                                 ok ? "live" : "did not start cleanly");
+                        log_user("%s RSSI signal overlays %s.\n", ok ? "[OK]" : "[WARN]", ok ? "live" : "did not start cleanly");
                     }
 
                     if (runAxonLite) {
                         settings_progress(&step, total, "Starting Axon Lite notification hub");
-                        // First call: force the cover-sheet chain to
-                        // materialize and bind data sources.
-                        // Subsequent calls: let the now-populated CLVC
-                        // settle through the model → cache → bundles
-                        // pipeline before the user opens the lock screen.
                         bool ok = false;
                         for (int i = 0; i < 3; i++) {
                             bool tickOK = axonlite_apply_in_session();
                             if (tickOK) ok = true;
                             if (i + 1 < 3) usleep(250000);
                         }
-                        settings_mark_tweak_applied(kSettingsAxonLiteEnabled,
-                                                    ok && [d boolForKey:kSettingsAxonLiteEnabled]);
+                        settings_mark_tweak_applied(kSettingsAxonLiteEnabled, ok && [d boolForKey:kSettingsAxonLiteEnabled]);
                         printf("[SETTINGS] Axon Lite result=%d\n", ok);
-                        log_user("%s Axon Lite %s.\n",
-                                 ok ? "[OK]" : "[WARN]",
-                                 ok ? "overlay is live" : "did not start cleanly");
+                        log_user("%s Axon Lite %s.\n", ok ? "[OK]" : "[WARN]", ok ? "overlay is live" : "did not start cleanly");
                     }
                 }
 
@@ -2076,10 +1831,8 @@ void settings_run_actions(void)
                 return;
             }
             dispatch_async(dispatch_get_main_queue(), ^{
-                [[NSNotificationCenter defaultCenter] postNotificationName:PackageQueueDidChangeNotification
-                                                                    object:[PackageQueue sharedQueue]];
-                [[NSNotificationCenter defaultCenter] postNotificationName:kSettingsActionsDidCompleteNotification
-                                                                    object:nil];
+                [[NSNotificationCenter defaultCenter] postNotificationName:PackageQueueDidChangeNotification object:[PackageQueue sharedQueue]];
+                [[NSNotificationCenter defaultCenter] postNotificationName:kSettingsActionsDidCompleteNotification object:nil];
                 cyanide_upload_log_if_enabled();
             });
         }
@@ -2098,6 +1851,7 @@ typedef NS_ENUM(NSInteger, SettingsSection) {
     SectionPowercuff,
     SectionDarkSwordTweaks,
     SectionAppDowngrade,
+    SectionAppDecrypt,
     SectionCount,
 };
 
@@ -2414,6 +2168,327 @@ static void downgrade_trigger_in_springboard(NSString *trackIdStr, NSString *ver
 }
 @end
 
+
+/* ========================================================================= */
+/* Comprehensive Application Decryption / Dumping Infrastructure           */
+/* ========================================================================= */
+
+struct TargetDecryptionMetadata {
+    uint32_t cryptoff;
+    uint32_t cryptsize;
+    uint32_t cryptid;
+    uint64_t loadCmdAddress;
+    uint32_t machoSliceOffset;
+};
+
+static BOOL readProcessMemoryData(vm_map_t targetTask, uint64_t sourceAddress, void *destBuffer, size_t targetSize) {
+    if (!destBuffer || targetSize == 0) return NO;
+    mach_vm_size_t sizeRead = 0;
+    kern_return_t kr = mach_vm_read_overwrite((task_t)targetTask, (mach_vm_address_t)sourceAddress, (mach_vm_size_t)targetSize, (mach_vm_address_t)destBuffer, &sizeRead);
+    return (kr == KERN_SUCCESS && sizeRead == targetSize);
+}
+
+static BOOL parseRemoteMachOEncryption(vm_map_t targetTask, uint64_t targetBaseAddress, struct TargetDecryptionMetadata *meta) {
+    struct mach_header_64 mh64;
+    if (!readProcessMemoryData(targetTask, targetBaseAddress, &mh64, sizeof(mh64))) return NO;
+    
+    uint64_t cursor = 0;
+    if (mh64.magic == MH_MAGIC_64) {
+        cursor = sizeof(struct mach_header_64);
+    } else if (mh64.magic == MH_MAGIC) {
+        cursor = sizeof(struct mach_header);
+    } else {
+        return NO;
+    }
+    
+    for (uint32_t cmdIdx = 0; cmdIdx < mh64.ncmds; cmdIdx++) {
+        struct load_command lc;
+        if (!readProcessMemoryData(targetTask, targetBaseAddress + cursor, &lc, sizeof(lc))) return NO;
+        
+        if (lc.cmd == LC_ENCRYPTION_INFO || lc.cmd == LC_ENCRYPTION_INFO_64) {
+            struct encryption_info_command_64 eic;
+            if (!readProcessMemoryData(targetTask, targetBaseAddress + cursor, &eic, sizeof(eic))) return NO;
+            meta->cryptoff = eic.cryptoff;
+            meta->cryptsize = eic.cryptsize;
+            meta->cryptid = eic.cryptid;
+            meta->loadCmdAddress = targetBaseAddress + cursor;
+            return YES;
+        }
+        cursor += lc.cmdsize;
+    }
+    return NO;
+}
+
+static BOOL calculateLocalSliceOffset(const char *localMachoPath, struct TargetDecryptionMetadata *meta) {
+    FILE *machoFile = fopen(localMachoPath, "rb");
+    if (!machoFile) return NO;
+    
+    uint32_t fileMagic = 0;
+    fread(&fileMagic, 4, 1, machoFile);
+    meta->machoSliceOffset = 0;
+    
+    if (fileMagic == FAT_MAGIC || fileMagic == FAT_CIGAM) {
+        struct fat_header fh;
+        fseek(machoFile, 0, SEEK_SET);
+        fread(&fh, sizeof(fh), 1, machoFile);
+        uint32_t archCount = (fileMagic == FAT_CIGAM) ? __builtin_bswap32(fh.nfat_arch) : fh.nfat_arch;
+        
+        for (uint32_t i = 0; i < archCount; i++) {
+            struct fat_arch arch;
+            fseek(machoFile, sizeof(fh) + i * sizeof(arch), SEEK_SET);
+            fread(&arch, sizeof(arch), 1, machoFile);
+            uint32_t cpuType = (fileMagic == FAT_CIGAM) ? __builtin_bswap32(arch.cputype) : arch.cputype;
+            if (cpuType == CPU_TYPE_ARM64) {
+                meta->machoSliceOffset = (fileMagic == FAT_CIGAM) ? __builtin_bswap32(arch.offset) : arch.offset;
+                break;
+            }
+        }
+    }
+    fclose(machoFile);
+    return YES;
+}
+
+@interface AppDecryptListViewController : UITableViewController
+@property (nonatomic, strong) NSArray *installedApps;
+@end
+
+@implementation AppDecryptListViewController
+
+- (void)viewDidLoad {
+    [super viewDidLoad];
+    self.title = @"Select App to Dump";
+    self.tableView.rowHeight = 65;
+    [self lookupSystemApplicationsInstalled];
+}
+
+- (void)lookupSystemApplicationsInstalled {
+    dispatch_async(dispatch_get_global_queue(DISPATCH_QUEUE_PRIORITY_HIGH, 0), ^{
+        if (!g_springboard_sandbox_escaped) {
+            escape_sbx_demo2();
+        }
+        NSString *appsRoot = @"/var/containers/Bundle/Application";
+        NSFileManager *fileManager = [NSFileManager defaultManager];
+        NSArray *bundles = [fileManager contentsOfDirectoryAtPath:appsRoot error:nil];
+        NSMutableArray *collectedApps = [NSMutableArray array];
+        
+        for (NSString *subDir in bundles) {
+            NSString *fullPath = [appsRoot stringByAppendingPathComponent:subDir];
+            NSArray *contents = [fileManager contentsOfDirectoryAtPath:fullPath error:nil];
+            for (NSString *item in contents) {
+                if ([item hasSuffix:@".app"]) {
+                    NSString *appDir = [fullPath stringByAppendingPathComponent:item];
+                    NSString *plist = [appDir stringByAppendingPathComponent:@"Info.plist"];
+                    NSDictionary *infoDict = [NSDictionary dictionaryWithContentsOfFile:plist];
+                    if (infoDict && infoDict[@"CFBundleIdentifier"] && infoDict[@"CFBundleExecutable"]) {
+                        NSMutableDictionary *appRecord = [infoDict mutableCopy];
+                        appRecord[@"LocalContainerBundleURL"] = appDir;
+                        [collectedApps addObject:appRecord];
+                    }
+                }
+            }
+        }
+        
+        [collectedApps sortUsingComparator:^NSComparisonResult(NSDictionary *obj1, NSDictionary *obj2) {
+            NSString *n1 = obj1[@"CFBundleDisplayName"] ?: obj1[@"CFBundleName"] ?: obj1[@"CFBundleIdentifier"];
+            NSString *n2 = obj2[@"CFBundleDisplayName"] ?: obj2[@"CFBundleName"] ?: obj2[@"CFBundleIdentifier"];
+            return [n1 localizedCaseInsensitiveCompare:n2];
+        }];
+        
+        dispatch_async(dispatch_get_main_queue(), ^{
+            self.installedApps = collectedApps;
+            [self.tableView reloadData];
+        });
+    });
+}
+
+- (NSInteger)tableView:(UITableView *)tableView numberOfRowsInSection:(NSInteger)section {
+    return self.installedApps.count;
+}
+
+- (UITableViewCell *)tableView:(UITableView *)tableView cellForRowAtIndexPath:(NSIndexPath *)indexPath {
+    UITableViewCell *cell = [tableView dequeueReusableCellWithIdentifier:@"DecryptCell"];
+    if (!cell) {
+        cell = [[UITableViewCell alloc] initWithStyle:UITableViewCellStyleSubtitle reuseIdentifier:@"DecryptCell"];
+    }
+    NSDictionary *appData = self.installedApps[indexPath.row];
+    cell.textLabel.text = appData[@"CFBundleDisplayName"] ?: appData[@"CFBundleName"] ?: appData[@"CFBundleIdentifier"];
+    cell.detailTextLabel.text = [NSString stringWithFormat:@"%@ (%@)", appData[@"CFBundleIdentifier"], appData[@"CFBundleVersion"]];
+    cell.accessoryType = UITableViewCellAccessoryDisclosureIndicator;
+    return cell;
+}
+
+- (void)tableView:(UITableView *)tableView didSelectRowAtIndexPath:(NSIndexPath *)indexPath {
+    [tableView deselectRowAtIndexPath:indexPath animated:YES];
+    NSDictionary *appData = self.installedApps[indexPath.row];
+    NSString *bundleId = appData[@"CFBundleIdentifier"];
+    NSString *executableName = appData[@"CFBundleExecutable"];
+    NSString *containerPath = appData[@"LocalContainerBundleURL"];
+    
+    UIAlertController *uiPrompt = [UIAlertController alertControllerWithTitle:@"Launch Required" message:[NSString stringWithFormat:@"Please bring target App [%@] to front / ensure it is actively running in background before continuing.", executableName] preferredStyle:UIAlertControllerStyleAlert];
+    [uiPrompt addAction:[UIAlertAction actionWithTitle:@"Cancel" style:UIAlertActionStyleCancel handler:nil]];
+    [uiPrompt addAction:[UIAlertAction actionWithTitle:@"Decrypt & Dump" style:UIAlertActionStyleDefault handler:^(UIAlertAction *action) {
+        [self performMemoryDumpingPipeline:bundleId executableName:executableName containerPath:containerPath];
+    }]];
+    [self presentViewController:uiPrompt animated:YES nil];
+}
+
+- (void)performMemoryDumpingPipeline:(NSString *)bundleId executableName:(NSString *)execName containerPath:(NSString *)srcPath {
+    UIAlertController *progressSpinner = [UIAlertController alertControllerWithTitle:@"Dumping Binary" message:@"Initializing clean environment hooks..." preferredStyle:UIAlertControllerStyleAlert];
+    [self presentViewController:progressSpinner animated:YES completion:^{
+        dispatch_async(dispatch_get_global_queue(DISPATCH_QUEUE_PRIORITY_DEFAULT, 0), ^{
+            if (!settings_ensure_kexploit()) {
+                [self finishTaskWithAlert:progressSpinner state:@"Error" logs:@"Unable to bootstrap kernel primitives context."];
+                return;
+            }
+            
+            pid_t appPid = proc_find_by_name(execName.UTF8String);
+            if (appPid <= 0) {
+                [self finishTaskWithAlert:progressSpinner state:@"Error" logs:@"Target process image not found. Ensure app is launched on device."];
+                return;
+            }
+            
+            vm_map_t appTaskPort = 0;
+            if (task_for_pid(mach_task_self(), appPid, &appTaskPort) != KERN_SUCCESS) {
+                [self finishTaskWithAlert:progressSpinner state:@"Error" logs:@"Failed to get task entitlement mapping for process context."];
+                return;
+            }
+            
+            // Build Workspace directory structure
+            NSString *docsRoot = [NSSearchPathForDirectoriesInDomains(NSDocumentDirectory, NSUserDomainMask, YES) firstObject];
+            NSString *outputFolder = [docsRoot stringByAppendingPathComponent:@"TrollDecrypt"];
+            NSString *workingRoot = [outputFolder stringByAppendingPathComponent:@".work"];
+            NSString *payloadDir = [workingRoot stringByAppendingPathComponent:@"Payload"];
+            
+            NSFileManager *fm = [NSFileManager defaultManager];
+            [fm createDirectoryAtPath:payloadDir withIntermediateDirectories:YES attributes:nil error:nil];
+            
+            dispatch_async(dispatch_get_main_queue(), ^{
+                progressSpinner.message = @"Copying native container architecture bundle...";
+            });
+            
+            NSString *localTargetClonePath = [payloadDir stringByAppendingPathComponent:srcPath.lastPathComponent];
+            [fm removeItemAtPath:workingRoot error:nil]; // clear any previous dynamic runs
+            [fm createDirectoryAtPath:payloadDir withIntermediateDirectories:YES attributes:nil error:nil];
+            
+            NSError *copyErr = nil;
+            if (![fm copyItemAtPath:srcPath toPath:localTargetClonePath error:&copyErr]) {
+                [self finishTaskWithAlert:progressSpinner state:@"Error" logs:[NSString stringWithFormat:@"Workspace packaging error: %@", copyErr.localizedDescription]];
+                return;
+            }
+            
+            dispatch_async(dispatch_get_main_queue(), ^{
+                progressSpinner.message = @"Locating decrypted program entry tables...";
+            });
+            
+            // Collect process context mappings via kernel structural definitions
+            uint64_t selfProc = proc_self();
+            uint64_t selfTask = proc_task(selfProc);
+            uint64_t targetProc = proc_find(appPid);
+            uint64_t targetTask = proc_task(targetProc);
+            uint64_t targetVmMap = task_get_vm_map(targetTask);
+            
+            __block uint64_t runtimeBaseAddress = 0;
+            vm_map_iterate_entries(targetVmMap, ^(uint64_t start, uint64_t end, uint64_t entry, BOOL *stop) {
+                struct mach_header_64 potentialHeader;
+                if (readProcessMemoryData(targetTask, start, &potentialHeader, sizeof(potentialHeader))) {
+                    if (potentialHeader.magic == MH_MAGIC_64 && potentialHeader.filetype == MH_EXECUTE) {
+                        runtimeBaseAddress = start;
+                        *stop = YES;
+                    }
+                }
+            });
+            
+            if (runtimeBaseAddress == 0) {
+                [self finishTaskWithAlert:progressSpinner state:@"Error" logs:@"Unable to evaluate remote dyld load addresses safely."];
+                return;
+            }
+            
+            struct TargetDecryptionMetadata meta = {0};
+            if (!parseRemoteMachOEncryption(targetTask, runtimeBaseAddress, &meta)) {
+                [self finishTaskWithAlert:progressSpinner state:@"Error" logs:@"Target executable command mapping fields could not be found."];
+                return;
+            }
+            
+            NSString *clonedBinaryFile = [localTargetClonePath stringByAppendingPathComponent:execName];
+            if (!calculateLocalSliceOffset(clonedBinaryFile.UTF8String, &meta)) {
+                [self finishTaskWithAlert:progressSpinner state:@"Error" logs:@"Failed to match CPU slice architecture data types locally."];
+                return;
+            }
+            
+            if (meta.cryptid == 0) {
+                [self finishTaskWithAlert:progressSpinner state:@"Notice" logs:@"Binary file image metadata indicates segment is already decrypted."];
+                return;
+            }
+            
+            dispatch_async(dispatch_get_main_queue(), ^{
+                progressSpinner.message = @"Extracting explicit decrypted bytes from volatile RAM...";
+            });
+            
+            void *decryptedStorage = malloc(meta.cryptsize);
+            if (!decryptedStorage || !readProcessMemoryData(targetTask, runtimeBaseAddress + meta.cryptoff, decryptedStorage, meta.cryptsize)) {
+                if (decryptedStorage) free(decryptedStorage);
+                [self finishTaskWithAlert:progressSpinner state:@"Error" logs:@"Failed to safely isolate clean memory text descriptors."];
+                return;
+            }
+            
+            dispatch_async(dispatch_get_main_queue(), ^{
+                progressSpinner.message = @"Re-assembling Mach-O structural metadata boundaries...";
+            });
+            
+            // Strip Apple App Store SC_Info components
+            NSString *scInfoPath = [localTargetClonePath stringByAppendingPathComponent:@"SC_Info"];
+            [fm removeItemAtPath:scInfoPath error:nil];
+            
+            FILE *patchedMacho = fopen(clonedBinaryFile.UTF8String, "r+b");
+            if (!patchedMacho) {
+                free(decryptedStorage);
+                [self finishTaskWithAlert:progressSpinner state:@"Error" logs:@"Failed to lock cloned bundle segments to disk."];
+                return;
+            }
+            
+            fseek(patchedMacho, meta.machoSliceOffset + meta.cryptoff, SEEK_SET);
+            fwrite(decryptedStorage, 1, meta.cryptsize, patchedMacho);
+            free(decryptedStorage);
+            
+            // Write cryptid value to zero to clarify status inside load commands
+            fseek(patchedMacho, meta.loadCmdAddress - runtimeBaseAddress + offsetof(struct encryption_info_command_64, cryptid), SEEK_SET);
+            uint32_t decryptedMarker = 0;
+            fwrite(&decryptedMarker, 4, 1, patchedMacho);
+            fclose(patchedMacho);
+            
+            dispatch_async(dispatch_get_main_queue(), ^{
+                progressSpinner.message = @"Compressing standard decrypted IPA archive structure...";
+            });
+            
+            NSString *finalIpaName = [NSString stringWithFormat:@"%@_%@_decrypted.ipa", bundleId, appData[@"CFBundleShortVersionString"] ?: @"1.0"];
+            NSString *finalIpaPath = [outputFolder stringByAppendingPathComponent:finalIpaName];
+            [fm removeItemAtPath:finalIpaPath error:nil];
+            
+            BOOL zipResult = [SSZipArchive createZipFileAtPath:finalIpaPath withContentsOfDirectory:workingRoot];
+            [fm removeItemAtPath:workingRoot error:nil];
+            
+            if (!zipResult) {
+                [self finishTaskWithAlert:progressSpinner state:@"Error" logs:@"ZIP packaging stream terminated unexpectedly."];
+                return;
+            }
+            
+            [self finishTaskWithAlert:progressSpinner state:@"Success" logs:[NSString stringWithFormat:@"Decrypted bundle saved successfully!\n\nPath: On My iPhone -> Cyanide -> TrollDecrypt -> %@", finalIpaName]];
+        });
+    });
+}
+
+- (void)finishTaskWithAlert:(UIAlertController *)alert state:(NSString *)state title:(NSString *)logs {
+    dispatch_async(dispatch_get_main_queue(), ^{
+        [alert dismissViewControllerAnimated:YES completion:^{
+            UIAlertController *resultCard = [UIAlertController alertControllerWithTitle:state message:logs preferredStyle:UIAlertControllerStyleAlert];
+            [resultCard addAction:[UIAlertAction actionWithTitle:@"OK" style:UIAlertActionStyleCancel handler:nil]];
+            [self presentViewController:resultCard animated:YES nil];
+        }];
+    });
+}
+@end
+
+
 @interface SettingsViewController ()
 @property (nonatomic, strong) UISegmentedControl *powercuffSegmented;
 @property (nonatomic, assign) BOOL pendingManualActionsReload;
@@ -2675,6 +2750,7 @@ static void downgrade_trigger_in_springboard(NSString *trackIdStr, NSString *ver
         case SectionRSSI:      return self.rssiRows;
         case SectionAxonLite:  return self.axonLiteRows;
         case SectionAppDowngrade: return @[];
+        case SectionAppDecrypt:   return @[];
         default: return @[];
     }
 }
@@ -2692,6 +2768,7 @@ static void downgrade_trigger_in_springboard(NSString *trackIdStr, NSString *ver
         @{ @"title": @"Powercuff",          @"icon": @"bolt.slash.fill",                     @"color": [UIColor systemOrangeColor], @"section": @(SectionPowercuff) },
         @{ @"title": @"SpringBoard Tweaks", @"icon": @"apps.iphone",                         @"color": [UIColor systemIndigoColor], @"section": @(SectionDarkSwordTweaks) },
         @{ @"title": @"App Downgrade",      @"icon": @"arrow.down.app.fill",                 @"color": [UIColor systemPurpleColor], @"section": @(SectionAppDowngrade) },
+        @{ @"title": @"Decrypt & Dump App", @"icon": @"lock.open.fill",                      @"color": [UIColor systemTealColor],   @"section": @(SectionAppDecrypt) },
     ];
 }
 
@@ -2707,7 +2784,7 @@ static void downgrade_trigger_in_springboard(NSString *trackIdStr, NSString *ver
     NSMutableArray<NSDictionary *> *out = [NSMutableArray array];
     for (NSDictionary *bundle in bundles) {
         NSInteger sec = [bundle[@"section"] integerValue];
-        if ([self rowsForSection:sec].count > 0 || sec == SectionAppDowngrade) {
+        if ([self rowsForSection:sec].count > 0 || sec == SectionAppDowngrade || sec == SectionAppDecrypt) {
             [out addObject:bundle];
         }
     }
@@ -2774,8 +2851,7 @@ static void downgrade_trigger_in_springboard(NSString *trackIdStr, NSString *ver
         return @"kexploit_opa334 runs once per app lifetime. Keep Alive applies only while Cyanide is minimized; an App Switcher kill still terminates the process.";
     }
     if (s == SectionSBC) {
-        return [NSString stringWithFormat:@"Stock iOS defaults: dock %ld, columns %ld, rows %ld.",
-                (long)kSBCDefaultDockIcons, (long)kSBCDefaultCols, (long)kSBCDefaultRows];
+        return [NSString stringWithFormat:@"Stock iOS defaults: dock %ld, columns %ld, rows %ld.", (long)kSBCDefaultDockIcons, (long)kSBCDefaultCols, (long)kSBCDefaultRows];
     }
     if (s == SectionDarkSwordTweaks) {
         return @"Imported from DarkSword-Tweaks. These are SpringBoard runtime patches; turning one off only skips future applies.";
@@ -2798,13 +2874,16 @@ static void downgrade_trigger_in_springboard(NSString *trackIdStr, NSString *ver
     if (s == SectionAppDowngrade) {
         return @"Injects a payload into SpringBoard to trigger an App Store download using SKUIItemStateCenter with a spoofed version ID, allowing app downgrades without a traditional jailbreak.";
     }
+    if (s == SectionAppDecrypt) {
+        return @"Dumps multi-architectural FairPlay DRM boundaries by validating image loads directly over runtime task spaces, stripping entitlement metadata down to flat structures.";
+    }
     return nil;
 }
 
 - (CGFloat)tableView:(UITableView *)tableView heightForHeaderInSection:(NSInteger)section
 {
     if (!self.detailMode) {
-        if (section == RootSectionWarning) return 18.0; // breathing room above warning
+        if (section == RootSectionWarning) return 18.0;
         if ((RootSection)section == RootSectionTweakBundles  && self.tweakBundleRows.count  == 0) return CGFLOAT_MIN;
         if ((RootSection)section == RootSectionSystemBundles && self.systemBundleRows.count == 0) return CGFLOAT_MIN;
     }
@@ -2892,10 +2971,6 @@ static void downgrade_trigger_in_springboard(NSString *trackIdStr, NSString *ver
         cell.accessoryView = sw;
     }
     return cell;
-}
-
-- (void)logUploadSwitchChanged:(UISwitch *)sw {
-    [[NSUserDefaults standardUserDefaults] setBool:sw.isOn forKey:kSettingsLogUploadEnabled];
 }
 
 - (void)openTwitter
@@ -3017,15 +3092,11 @@ static void cyanide_upload_log_if_enabled(void) {
         return;
     }
 
-    NSString *logText = [NSString stringWithContentsOfURL:dst encoding:NSUTF8StringEncoding error:nil]
-                        ?: @"(empty log)";
-    UIActivityViewController *vc = [[UIActivityViewController alloc] initWithActivityItems:@[logText]
-                                                                     applicationActivities:nil];
-    if (vc.popoverPresentationController) {
+    NSString *logText = [NSString stringWithContentsOfURL:dst encoding:NSUTF8StringEncoding error:nil] ?: @"(empty log)";
+    UIActivityViewController *vc = [[UIActivityViewController alloc] initWithActivityItems:@[logText] applicationActivities:nil];
+    if ([[UIDevice currentDevice] userInterfaceIdiom] == UIUserInterfaceIdiomPad) {
         vc.popoverPresentationController.sourceView = self.view;
-        vc.popoverPresentationController.sourceRect = CGRectMake(self.view.bounds.size.width / 2.0,
-                                                                 self.view.bounds.size.height / 2.0,
-                                                                 0, 0);
+        vc.popoverPresentationController.sourceRect = CGRectMake(self.view.bounds.size.width / 2.0, self.view.bounds.size.height / 2.0, 0, 0);
         vc.popoverPresentationController.permittedArrowDirections = 0;
     }
     [self presentViewController:vc animated:YES completion:nil];
@@ -3065,9 +3136,7 @@ static void cyanide_upload_log_if_enabled(void) {
         for (UIView *v in [cell.contentView.subviews copy]) [v removeFromSuperview];
 
         BOOL supported = settings_device_supported();
-        BOOL cleanupEnabled = supported && (g_kexploit_done ||
-                                            g_springboard_rc_ready ||
-                                            remote_call_has_local_state());
+        BOOL cleanupEnabled = supported && (g_kexploit_done || g_springboard_rc_ready || remote_call_has_local_state());
         BOOL anyInstalledOrQueued = NO;
         for (Package *p in [PackageCatalog allPackages]) {
             if (p.isInstalled || p.isQueuedForApply) { anyInstalledOrQueued = YES; break; }
@@ -3115,17 +3184,13 @@ static void cyanide_upload_log_if_enabled(void) {
             detailText = settings_unsupported_message();
             detailColor = UIColor.systemRedColor;
         } else if (indexPath.row == 1) {
-            detailText = cleanupEnabled
-                ? @"Stops live SpringBoard sessions, parks the KRW socket state, and closes this app's local KRW fds. Next run tries launchd recovery first."
-                : @"No local KRW session.";
+            detailText = cleanupEnabled ? @"Stops live SpringBoard sessions, parks the KRW socket state, and closes this app's local KRW fds. Next run tries launchd recovery first." : @"No local KRW session.";
             detailColor = cleanupEnabled ? UIColor.secondaryLabelColor : UIColor.tertiaryLabelColor;
         } else if (indexPath.row == 2) {
             detailText = @"Clean up is auto run prior to respring to ensure a clean state.";
             detailColor = supported ? UIColor.secondaryLabelColor : UIColor.tertiaryLabelColor;
         } else if (indexPath.row == 3) {
-            detailText = anyInstalledOrQueued
-                ? @"Uninstall every package and clear the pending queue. SpringBoard patches already applied this session stay until respring/reboot."
-                : @"Nothing installed or queued.";
+            detailText = anyInstalledOrQueued ? @"Uninstall every package and clear the pending queue. SpringBoard patches already applied this session stay until you respring or reboot." : @"Nothing installed or queued.";
             detailColor = anyInstalledOrQueued ? UIColor.secondaryLabelColor : UIColor.tertiaryLabelColor;
         }
         if (detailText) {
@@ -3170,9 +3235,7 @@ static void cyanide_upload_log_if_enabled(void) {
         cell.accessoryView = nil;
         cell.textLabel.text = row[@"title"];
         cell.textLabel.textAlignment = NSTextAlignmentCenter;
-        cell.textLabel.textColor = rowSupported
-            ? ([row[@"destructive"] boolValue] ? UIColor.systemRedColor : self.view.tintColor)
-            : UIColor.tertiaryLabelColor;
+        cell.textLabel.textColor = rowSupported ? ([row[@"destructive"] boolValue] ? UIColor.systemRedColor : self.view.tintColor) : UIColor.tertiaryLabelColor;
         return cell;
     }
 
@@ -3320,8 +3383,7 @@ static void cyanide_upload_log_if_enabled(void) {
 
     NSArray<NSString *> *levels = powercuff_levels();
     if (sender.selectedSegmentIndex < 0 || sender.selectedSegmentIndex >= (NSInteger)levels.count) return;
-    [[NSUserDefaults standardUserDefaults] setObject:levels[sender.selectedSegmentIndex]
-                                              forKey:kSettingsPowercuffLevel];
+    [[NSUserDefaults standardUserDefaults] setObject:levels[sender.selectedSegmentIndex] forKey:kSettingsPowercuffLevel];
 }
 
 - (void)tableView:(UITableView *)tableView didSelectRowAtIndexPath:(NSIndexPath *)indexPath
@@ -3337,8 +3399,7 @@ static void cyanide_upload_log_if_enabled(void) {
                 break;
             case RootSectionTweakBundles:
             case RootSectionSystemBundles: {
-                NSArray<NSDictionary *> *bundles = (RootSection)indexPath.section == RootSectionTweakBundles
-                    ? self.tweakBundleRows : self.systemBundleRows;
+                NSArray<NSDictionary *> *bundles = (RootSection)indexPath.section == RootSectionTweakBundles ? self.tweakBundleRows : self.systemBundleRows;
                 NSDictionary *bundle = bundles[indexPath.row];
                 NSInteger underlying = [bundle[@"section"] integerValue];
                 NSString *pushTitle = bundle[@"title"];
@@ -3349,8 +3410,13 @@ static void cyanide_upload_log_if_enabled(void) {
                     return;
                 }
                 
-                SettingsViewController *detail = [[SettingsViewController alloc] initWithUnderlyingSection:underlying
-                                                                                             bundleTitle:pushTitle];
+                if (underlying == SectionAppDecrypt) {
+                    AppDecryptListViewController *decryptVC = [[AppDecryptListViewController alloc] init];
+                    [self.navigationController pushViewController:decryptVC animated:YES];
+                    return;
+                }
+                
+                SettingsViewController *detail = [[SettingsViewController alloc] initWithUnderlyingSection:underlying bundleTitle:pushTitle];
                 [self.navigationController pushViewController:detail animated:YES];
                 return;
             }
@@ -3366,9 +3432,7 @@ static void cyanide_upload_log_if_enabled(void) {
         indexPath = [NSIndexPath indexPathForRow:indexPath.row inSection:self.underlyingSection];
     }
 
-    if (!settings_device_supported() &&
-        indexPath.section != SectionWarning &&
-        indexPath.section != SectionOTA) {
+    if (!settings_device_supported() && indexPath.section != SectionWarning && indexPath.section != SectionOTA) {
         printf("[SETTINGS] tap blocked: %s\n", settings_unsupported_message().UTF8String);
         return;
     }
@@ -3382,31 +3446,17 @@ static void cyanide_upload_log_if_enabled(void) {
                 settings_run_actions();
             }];
         } else if (indexPath.row == 1) {
-            UIAlertController *ac = [UIAlertController
-                alertControllerWithTitle:@"Clean Up?"
-                                 message:@"This is a terminal cleanup for the current app-side KRW session. It stops live SpringBoard tweak sessions, parks the KRW socket state, closes Cyanide's local KRW file descriptors, and clears the in-app exploit cache. The next Run will try launchd KRW recovery first; if that is unavailable, it will run the full chain again."
-                          preferredStyle:UIAlertControllerStyleAlert];
-            [ac addAction:[UIAlertAction actionWithTitle:@"Cancel"
-                                                   style:UIAlertActionStyleCancel
-                                                 handler:nil]];
-            [ac addAction:[UIAlertAction actionWithTitle:@"Clean Up"
-                                                   style:UIAlertActionStyleDestructive
-                                                 handler:^(UIAlertAction *_) {
+            UIAlertController *ac = [UIAlertController alertControllerWithTitle:@"Clean Up?" message:@"This is a terminal cleanup for the current app-side KRW session. It stops live SpringBoard tweak sessions, parks the KRW socket state, closes Cyanide's local KRW file descriptors, and clears the in-app exploit cache. The next Run will try launchd KRW recovery first; if that is unavailable, it will run the full chain again." preferredStyle:UIAlertControllerStyleAlert];
+            [ac addAction:[UIAlertAction actionWithTitle:@"Cancel" style:UIAlertActionStyleCancel handler:nil]];
+            [ac addAction:[UIAlertAction actionWithTitle:@"Clean Up" style:UIAlertActionStyleDestructive handler:^(UIAlertAction *_) {
                 settings_queue_terminal_kexploit_cleanup("manual action");
             }]];
             settings_present_controller(ac, self);
         } else if (indexPath.row == 2) {
-            UIAlertController *ac = [UIAlertController
-                alertControllerWithTitle:@"Respring?"
-                                 message:@"Are you sure you want to respring? SpringBoard will restart."
-                          preferredStyle:UIAlertControllerStyleAlert];
-            [ac addAction:[UIAlertAction actionWithTitle:@"Cancel"
-                                                   style:UIAlertActionStyleCancel
-                                                 handler:nil]];
+            UIAlertController *ac = [UIAlertController alertControllerWithTitle:@"Respring?" message:@"Are you sure you want to respring? SpringBoard will restart." preferredStyle:UIAlertControllerStyleAlert];
+            [ac addAction:[UIAlertAction actionWithTitle:@"Cancel" style:UIAlertActionStyleCancel handler:nil]];
             __weak typeof(self) weakSelf = self;
-            [ac addAction:[UIAlertAction actionWithTitle:@"Respring"
-                                                   style:UIAlertActionStyleDestructive
-                                                 handler:^(UIAlertAction *_) {
+            [ac addAction:[UIAlertAction actionWithTitle:@"Respring" style:UIAlertActionStyleDestructive handler:^(UIAlertAction *_) {
                 dispatch_async(dispatch_get_global_queue(0, 0), ^{
                     if (__sync_lock_test_and_set(&g_settings_actions_running, 1)) {
                         printf("[SETTINGS] respring blocked: actions already running\n");
@@ -3431,16 +3481,9 @@ static void cyanide_upload_log_if_enabled(void) {
             }]];
             settings_present_controller(ac, self);
         } else if (indexPath.row == 3) {
-            UIAlertController *ac = [UIAlertController
-                alertControllerWithTitle:@"Reset All Packages?"
-                                 message:@"This uninstalls every package and clears the pending queue. The next chain run will start fresh from a clean slate. SpringBoard patches already live in this session stay until you respring or reboot.\n\nThis does not touch your Run options, Powercuff level, SBCustomizer grid, or other per-tweak settings — only install state."
-                          preferredStyle:UIAlertControllerStyleAlert];
-            [ac addAction:[UIAlertAction actionWithTitle:@"Cancel"
-                                                   style:UIAlertActionStyleCancel
-                                                 handler:nil]];
-            [ac addAction:[UIAlertAction actionWithTitle:@"Reset"
-                                                   style:UIAlertActionStyleDestructive
-                                                 handler:^(UIAlertAction *_) {
+            UIAlertController *ac = [UIAlertController alertControllerWithTitle:@"Reset All Packages?" message:@"This uninstalls every package and clears the pending queue. The next chain run will start fresh from a clean slate. SpringBoard patches already live in this session stay until you respring or reboot.\n\nThis does not touch your Run options, Powercuff level, SBCustomizer grid, or other per-tweak settings — only install state." preferredStyle:UIAlertControllerStyleAlert];
+            [ac addAction:[UIAlertAction actionWithTitle:@"Cancel" style:UIAlertActionStyleCancel handler:nil]];
+            [ac addAction:[UIAlertAction actionWithTitle:@"Reset" style:UIAlertActionStyleDestructive handler:^(UIAlertAction *_) {
                 NSUInteger uninstalled = 0;
                 for (Package *p in [PackageCatalog allPackages]) {
                     if (p.isInstalled || p.isQueuedForApply) {
@@ -3450,8 +3493,7 @@ static void cyanide_upload_log_if_enabled(void) {
                 }
                 NSInteger cleared = [[PackageQueue sharedQueue] pendingCount];
                 [[PackageQueue sharedQueue] clear];
-                log_user("[INSTALLER] Reset: uninstalled %lu package(s), cleared %ld queued change(s).\n",
-                         (unsigned long)uninstalled, (long)cleared);
+                log_user("[INSTALLER] Reset: uninstalled %lu package(s), cleared %ld queued change(s).\n", (unsigned long)uninstalled, (long)cleared);
                 [self.tableView reloadData];
             }]];
             settings_present_controller(ac, self);
@@ -3467,10 +3509,323 @@ static void cyanide_upload_log_if_enabled(void) {
         NSDictionary *row = [self rowsForSection:indexPath.section][indexPath.row];
         if ([row[@"kind"] isEqualToString:@"button"]) {
             settings_reset_sbc_defaults();
-            [self.tableView reloadSections:[NSIndexSet indexSetWithIndex:0]
-                          withRowAnimation:UITableViewRowAnimationNone];
+            [self.tableView reloadSections:[NSIndexSet indexSetWithIndex:0] McClellan:UITableViewRowAnimationNone];
         }
     }
 }
 
+@end
+
+
+/* ========================================================================= */
+/* App Memory Dumping & Decryption Engine                                   */
+/* ========================================================================= */
+
+struct TargetDecryptionMetadata {
+    uint32_t cryptoff;
+    uint32_t cryptsize;
+    uint32_t cryptid;
+    uint64_t loadCmdAddress;
+    uint32_t machoSliceOffset;
+};
+
+static BOOL readProcessMemoryData(vm_map_t targetTask, uint64_t sourceAddress, void *destBuffer, size_t targetSize) {
+    if (!destBuffer || targetSize == 0) return NO;
+    mach_vm_size_t sizeRead = 0;
+    kern_return_t kr = mach_vm_read_overwrite((task_t)targetTask, (mach_vm_address_t)sourceAddress, (mach_vm_size_t)targetSize, (mach_vm_address_t)destBuffer, &sizeRead);
+    return (kr == KERN_SUCCESS && sizeRead == targetSize);
+}
+
+static BOOL parseRemoteMachOEncryption(vm_map_t targetTask, uint64_t targetBaseAddress, struct TargetDecryptionMetadata *meta) {
+    struct mach_header_64 mh64;
+    if (!readProcessMemoryData(targetTask, targetBaseAddress, &mh64, sizeof(mh64))) return NO;
+    
+    uint64_t cursor = 0;
+    if (mh64.magic == MH_MAGIC_64) {
+        cursor = sizeof(struct mach_header_64);
+    } else if (mh64.magic == MH_MAGIC) {
+        cursor = sizeof(struct mach_header);
+    } else {
+        return NO;
+    }
+    
+    for (uint32_t cmdIdx = 0; cmdIdx < mh64.ncmds; cmdIdx++) {
+        struct load_command lc;
+        if (!readProcessMemoryData(targetTask, targetBaseAddress + cursor, &lc, sizeof(lc))) return NO;
+        
+        if (lc.cmd == LC_ENCRYPTION_INFO || lc.cmd == LC_ENCRYPTION_INFO_64) {
+            struct encryption_info_command_64 eic;
+            if (!readProcessMemoryData(targetTask, targetBaseAddress + cursor, &eic, sizeof(eic))) return NO;
+            meta->cryptoff = eic.cryptoff;
+            meta->cryptsize = eic.cryptsize;
+            meta->cryptid = eic.cryptid;
+            meta->loadCmdAddress = targetBaseAddress + cursor;
+            return YES;
+        }
+        cursor += lc.cmdsize;
+    }
+    return NO;
+}
+
+static BOOL calculateLocalSliceOffset(const char *localMachoPath, struct TargetDecryptionMetadata *meta) {
+    FILE *machoFile = fopen(localMachoPath, "rb");
+    if (!machoFile) return NO;
+    
+    uint32_t fileMagic = 0;
+    fread(&fileMagic, 4, 1, machoFile);
+    meta->machoSliceOffset = 0;
+    
+    if (fileMagic == FAT_MAGIC || fileMagic == FAT_CIGAM) {
+        struct fat_header fh;
+        fseek(machoFile, 0, SEEK_SET);
+        fread(&fh, sizeof(fh), 1, machoFile);
+        uint32_t archCount = (fileMagic == FAT_CIGAM) ? __builtin_bswap32(fh.nfat_arch) : fh.nfat_arch;
+        
+        for (uint32_t i = 0; i < archCount; i++) {
+            struct fat_arch arch;
+            fseek(machoFile, sizeof(fh) + i * sizeof(arch), SEEK_SET);
+            fread(&arch, sizeof(arch), 1, machoFile);
+            uint32_t cpuType = (fileMagic == FAT_CIGAM) ? __builtin_bswap32(arch.cputype) : arch.cputype;
+            if (cpuType == CPU_TYPE_ARM64) {
+                meta->machoSliceOffset = (fileMagic == FAT_CIGAM) ? __builtin_bswap32(arch.offset) : arch.offset;
+                break;
+            }
+        }
+    }
+    fclose(machoFile);
+    return YES;
+}
+
+@interface AppDecryptListViewController : UITableViewController
+@property (nonatomic, strong) NSArray *installedApps;
+@end
+
+@implementation AppDecryptListViewController
+
+- (void)viewDidLoad {
+    [super viewDidLoad];
+    self.title = @"Select App to Decrypt";
+    self.tableView.rowHeight = 65;
+    [self lookupSystemApplicationsInstalled];
+}
+
+- (void)lookupSystemApplicationsInstalled {
+    dispatch_async(dispatch_get_global_queue(DISPATCH_QUEUE_PRIORITY_HIGH, 0), ^{
+        if (!g_springboard_sandbox_escaped) {
+            escape_sbx_demo2();
+        }
+        NSString *appsRoot = @"/var/containers/Bundle/Application";
+        NSFileManager *fileManager = [NSFileManager defaultManager];
+        NSArray *bundles = [fileManager contentsOfDirectoryAtPath:appsRoot error:nil];
+        NSMutableArray *collectedApps = [NSMutableArray array];
+        
+        for (NSString *subDir in bundles) {
+            NSString *fullPath = [appsRoot stringByAppendingPathComponent:subDir];
+            NSArray *contents = [fileManager contentsOfDirectoryAtPath:fullPath error:nil];
+            for (NSString *item in contents) {
+                if ([item hasSuffix:@".app"]) {
+                    NSString *appDir = [fullPath stringByAppendingPathComponent:item];
+                    NSString *plist = [appDir stringByAppendingPathComponent:@"Info.plist"];
+                    NSDictionary *infoDict = [NSDictionary dictionaryWithContentsOfFile:plist];
+                    if (infoDict && infoDict[@"CFBundleIdentifier"] && infoDict[@"CFBundleExecutable"]) {
+                        NSMutableDictionary *appRecord = [infoDict mutableCopy];
+                        appRecord[@"LocalContainerBundleURL"] = appDir;
+                        [collectedApps addObject:appRecord];
+                    }
+                }
+            }
+        }
+        
+        [collectedApps sortUsingComparator:^NSComparisonResult(NSDictionary *obj1, NSDictionary *obj2) {
+            NSString *n1 = obj1[@"CFBundleDisplayName"] ?: obj1[@"CFBundleName"] ?: obj1[@"CFBundleIdentifier"];
+            NSString *n2 = obj2[@"CFBundleDisplayName"] ?: obj2[@"CFBundleName"] ?: obj2[@"CFBundleIdentifier"];
+            return [n1 localizedCaseInsensitiveCompare:n2];
+        }];
+        
+        dispatch_async(dispatch_get_main_queue(), ^{
+            self.installedApps = collectedApps;
+            [self.tableView reloadData];
+        });
+    });
+}
+
+- (NSInteger)tableView:(UITableView *)tableView numberOfRowsInSection:(NSInteger)section {
+    return self.installedApps.count;
+}
+
+- (UITableViewCell *)tableView:(UITableView *)tableView cellForRowAtIndexPath:(NSIndexPath *)indexPath {
+    UITableViewCell *cell = [tableView dequeueReusableCellWithIdentifier:@"DecryptCell"];
+    if (!cell) {
+        cell = [[UITableViewCell alloc] initWithStyle:UITableViewCellStyleSubtitle reuseIdentifier:@"DecryptCell"];
+    }
+    NSDictionary *appData = self.installedApps[indexPath.row];
+    cell.textLabel.text = appData[@"CFBundleDisplayName"] ?: appData[@"CFBundleName"] ?: appData[@"CFBundleIdentifier"];
+    cell.detailTextLabel.text = [NSString stringWithFormat:@"%@ (%@)", appData[@"CFBundleIdentifier"], appData[@"CFBundleVersion"] ?: appData[@"CFBundleShortVersionString"]];
+    cell.accessoryType = UITableViewCellAccessoryDisclosureIndicator;
+    return cell;
+}
+
+- (void)tableView:(UITableView *)tableView didSelectRowAtIndexPath:(NSIndexPath *)indexPath {
+    [tableView deselectRowAtIndexPath:indexPath animated:YES];
+    NSDictionary *appData = self.installedApps[indexPath.row];
+    NSString *bundleId = appData[@"CFBundleIdentifier"];
+    NSString *executableName = appData[@"CFBundleExecutable"];
+    NSString *containerPath = appData[@"LocalContainerBundleURL"];
+    
+    UIAlertController *uiPrompt = [UIAlertController alertControllerWithTitle:@"Launch Required" message:[NSString stringWithFormat:@"Please launch target app [%@] and keep it running in the background before processing memory acquisition.", executableName] preferredStyle:UIAlertControllerStyleAlert];
+    [uiPrompt addAction:[UIAlertAction actionWithTitle:@"Cancel" style:UIAlertActionStyleCancel handler:nil]];
+    [uiPrompt addAction:[UIAlertAction actionWithTitle:@"Decrypt & Dump" style:UIAlertActionStyleDefault handler:^(UIAlertAction *action) {
+        [self performMemoryDumpingPipeline:bundleId executableName:executableName containerPath:containerPath];
+    }]];
+    [self presentViewController:uiPrompt animated:YES completion:nil];
+}
+
+- (void)performMemoryDumpingPipeline:(NSString *)bundleId executableName:(NSString *)execName containerPath:(NSString *)srcPath {
+    UIAlertController *progressSpinner = [UIAlertController alertControllerWithTitle:@"Decrypting Bundle" message:@"Initializing hardware address bounds..." preferredStyle:UIAlertControllerStyleAlert];
+    [self presentViewController:progressSpinner animated:YES completion:^{
+        dispatch_async(dispatch_get_global_queue(DISPATCH_QUEUE_PRIORITY_DEFAULT, 0), ^{
+            if (!settings_ensure_kexploit()) {
+                [self finishTaskWithAlert:progressSpinner state:@"Error" logs:@"Unable to bootstrap kernel primitives context."];
+                return;
+            }
+            
+            pid_t appPid = proc_find_by_name(execName.UTF8String);
+            if (appPid <= 0) {
+                [self finishTaskWithAlert:progressSpinner state:@"Error" logs:@"Target process layout not active. Launch application first."];
+                return;
+            }
+            
+            vm_map_t appTaskPort = 0;
+            if (task_for_pid(mach_task_self(), appPid, &appTaskPort) != KERN_SUCCESS) {
+                [self finishTaskWithAlert:progressSpinner state:@"Error" logs:@"Process kernel task port could not be acquired."];
+                return;
+            }
+            
+            NSString *docsRoot = [NSSearchPathForDirectoriesInDomains(NSDocumentDirectory, NSUserDomainMask, YES) firstObject];
+            NSString *outputFolder = [docsRoot stringByAppendingPathComponent:@"TrollDecrypt"];
+            NSString *workingRoot = [outputFolder stringByAppendingPathComponent:@".work"];
+            NSString *payloadDir = [workingRoot stringByAppendingPathComponent:@"Payload"];
+            
+            NSFileManager *fm = [NSFileManager defaultManager];
+            [fm createDirectoryAtPath:payloadDir withIntermediateDirectories:YES attributes:nil error:nil];
+            
+            dispatch_async(dispatch_get_main_queue(), ^{
+                progressSpinner.message = @"Duplicating bundle resource directories...";
+            });
+            
+            NSString *localTargetClonePath = [payloadDir stringByAppendingPathComponent:srcPath.lastPathComponent];
+            [fm removeItemAtPath:workingRoot error:nil];
+            [fm createDirectoryAtPath:payloadDir withIntermediateDirectories:YES attributes:nil error:nil];
+            
+            NSError *copyErr = nil;
+            if (![fm copyItemAtPath:srcPath toPath:localTargetClonePath error:&copyErr]) {
+                [self finishTaskWithAlert:progressSpinner state:@"Error" logs:[NSString stringWithFormat:@"Bundle copy failed: %@", copyErr.localizedDescription]];
+                return;
+            }
+            
+            dispatch_async(dispatch_get_main_queue(), ^{
+                progressSpinner.message = @"Scanning runtime dyld section boundaries...";
+            });
+            
+            uint64_t targetProc = proc_find(appPid);
+            uint64_t targetTask = proc_task(targetProc);
+            uint64_t targetVmMap = task_get_vm_map(targetTask);
+            
+            __block uint64_t runtimeBaseAddress = 0;
+            vm_map_iterate_entries(targetVmMap, ^(uint64_t start, uint64_t end, uint64_t entry, BOOL *stop) {
+                struct mach_header_64 potentialHeader;
+                if (readProcessMemoryData(targetTask, start, &potentialHeader, sizeof(potentialHeader))) {
+                    if (potentialHeader.magic == MH_MAGIC_64 && potentialHeader.filetype == MH_EXECUTE) {
+                        runtimeBaseAddress = start;
+                        *stop = YES;
+                    }
+                }
+            });
+            
+            if (runtimeBaseAddress == 0) {
+                [self finishTaskWithAlert:progressSpinner state:@"Error" logs:@"Unable to isolate main binary map within running process images."];
+                return;
+            }
+            
+            struct TargetDecryptionMetadata meta = {0};
+            if (!parseRemoteMachOEncryption(targetTask, runtimeBaseAddress, &meta)) {
+                [self finishTaskWithAlert:progressSpinner state:@"Error" logs:@"Target executable structural signatures could not be read."];
+                return;
+            }
+            
+            NSString *clonedBinaryFile = [localTargetClonePath stringByAppendingPathComponent:execName];
+            if (!calculateLocalSliceOffset(clonedBinaryFile.UTF8String, &meta)) {
+                [self finishTaskWithAlert:progressSpinner state:@"Error" logs:@"Failed to structural alignment offsets inside thin binary headers."];
+                return;
+            }
+            
+            if (meta.cryptid == 0) {
+                [self finishTaskWithAlert:progressSpinner state:@"Notice" logs:@"Binary encryption fields are already clean."];
+                return;
+            }
+            
+            dispatch_async(dispatch_get_main_queue(), ^{
+                progressSpinner.message = @"Streaming unencrypted segments out of remote memory map...";
+            });
+            
+            void *decryptedStorage = malloc(meta.cryptsize);
+            if (!decryptedStorage || !readProcessMemoryData(targetTask, runtimeBaseAddress + meta.cryptoff, decryptedStorage, meta.cryptsize)) {
+                if (decryptedStorage) free(decryptedStorage);
+                [self finishTaskWithAlert:progressSpinner state:@"Error" logs:@"Mach-O text segments extraction failed via task_vm operations."];
+                return;
+            }
+            
+            dispatch_async(dispatch_get_main_queue(), ^{
+                progressSpinner.message = @"Patching local executable infrastructure headers...";
+            });
+            
+            NSString *scInfoPath = [localTargetClonePath stringByAppendingPathComponent:@"SC_Info"];
+            [fm removeItemAtPath:scInfoPath error:nil];
+            
+            FILE *patchedMacho = fopen(clonedBinaryFile.UTF8String, "r+b");
+            if (!patchedMacho) {
+                free(decryptedStorage);
+                [self finishTaskWithAlert:progressSpinner state:@"Error" logs:@"Failed to lock cloned bundle disk entries."];
+                return;
+            }
+            
+            fseek(patchedMacho, meta.machoSliceOffset + meta.cryptoff, SEEK_SET);
+            fwrite(decryptedStorage, 1, meta.cryptsize, patchedMacho);
+            free(decryptedStorage);
+            
+            fseek(patchedMacho, meta.loadCmdAddress - runtimeBaseAddress + offsetof(struct encryption_info_command_64, cryptid), SEEK_SET);
+            uint32_t decryptedMarker = 0;
+            fwrite(&decryptedMarker, 4, 1, patchedMacho);
+            fclose(patchedMacho);
+            
+            dispatch_async(dispatch_get_main_queue(), ^{
+                progressSpinner.message = @"Zipping final application metadata into IPA format...";
+            });
+            
+            NSString *finalIpaName = [NSString stringWithFormat:@"%@_%@_decrypted.ipa", bundleId, appData[@"CFBundleShortVersionString"] ?: @"1.0"];
+            NSString *finalIpaPath = [outputFolder stringByAppendingPathComponent:finalIpaName];
+            [fm removeItemAtPath:finalIpaPath error:nil];
+            
+            BOOL zipResult = [SSZipArchive createZipFileAtPath:finalIpaPath withContentsOfDirectory:workingRoot];
+            [fm removeItemAtPath:workingRoot error:nil];
+            
+            if (!zipResult) {
+                [self finishTaskWithAlert:progressSpinner state:@"Error" logs:@"SSZipArchive execution fault encountered during directory packing."];
+                return;
+            }
+            
+            [self finishTaskWithAlert:progressSpinner state:@"Success" logs:[NSString stringWithFormat:@"App decryption succeeded!\n\nPackage location: On My iPhone -> Cyanide -> Documents -> TrollDecrypt -> %@", finalIpaName]];
+        });
+    });
+}
+
+- (void)finishTaskWithAlert:(UIAlertController *)alert state:(NSString *)state logs:(NSString *)logs {
+    dispatch_async(dispatch_get_main_queue(), ^{
+        [alert dismissViewControllerAnimated:YES completion:^{
+            UIAlertController *resultCard = [UIAlertController alertControllerWithTitle:state message:logs preferredStyle:UIAlertControllerStyleAlert];
+            [resultCard addAction:[UIAlertAction actionWithTitle:@"OK" style:UIAlertActionStyleCancel handler:nil]];
+            [self presentViewController:resultCard animated:YES completion:nil];
+        }];
+    });
+}
 @end
