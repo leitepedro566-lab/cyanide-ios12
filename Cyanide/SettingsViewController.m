@@ -1,3 +1,8 @@
+//
+//  SettingsViewController.m
+//  Cyanide
+//
+
 #import "SettingsViewController.h"
 #import "kexploit/kexploit_opa334.h"
 #import "tweaks/sbcustomizer.h"
@@ -148,6 +153,10 @@ static NSString * const kSettingsRemoteCallStateDidChangeNotification = @"Settin
 NSString * const kSettingsActionsDidCompleteNotification = @"SettingsActionsDidCompleteNotification";
 static NSArray<NSString *> * const kPowercuffLevels = nil;
 
+// Session-scoped record of which tweaks were actually applied since launch.
+// Distinct from the persisted NSUserDefaults enable flag — these are wiped on
+// app launch and whenever the SpringBoard RemoteCall session is torn down, so
+// the UI can show accurate "Installed" state rather than a stale toggle.
 static NSMutableSet<NSString *> *g_applied_tweak_keys = nil;
 
 static NSMutableSet<NSString *> *settings_applied_keys_set(void)
@@ -259,6 +268,9 @@ static void settings_notify_remote_call_state_changed(void);
 static void settings_request_all_live_loops_stop(const char *reason);
 
 static BOOL settings_should_log_statbar_tick(NSUInteger tick) {
+    // One-shot: log the very first tick so the user can see the loop took
+    // off, then go silent forever. The polling continues; we just stop
+    // narrating it.
     return tick == 0;
 }
 
@@ -338,10 +350,16 @@ static BOOL settings_statbar_screen_awake(void)
 
 static void settings_handle_springboard_restart(void)
 {
+    // SpringBoard just (re)started. Every pointer we cached from the previous
+    // SB incarnation — class addresses, selector slots, retained objects,
+    // ivar offsets, the trojan thread, our shmem map — is stale. Calling
+    // through any of them under SB-2 hands a wild signed function pointer to
+    // BLRAA and PAC-faults us. Drop everything before the next loop tick.
     dispatch_async(dispatch_get_global_queue(QOS_CLASS_USER_INITIATED, 0), ^{
         BOOL hadSession = NO;
         @synchronized (settings_rc_lock()) {
             hadSession = (g_springboard_rc_ready != 0);
+            // Tell live loops to bail at their next interval check.
             settings_request_all_live_loops_stop("SpringBoard restart");
             g_springboard_rc_ready = 0;
             g_springboard_sandbox_escaped = 0;
@@ -390,6 +408,10 @@ static void settings_install_screen_awake_observers(void)
             g_display_status_notify_token = NOTIFY_TOKEN_INVALID;
         }
 
+        // Darwin notify fires when SpringBoard finishes its boot/respawn.
+        // Either we just launched and SB is fine (cleanup is a no-op against
+        // already-zero state) or SB crashed under us and we MUST drop every
+        // cached pointer before the live loops fire again into SB-2.
         status = notify_register_dispatch("com.apple.springboard.finishedstartup",
                                           &g_springboard_finished_startup_notify_token,
                                           dispatch_get_main_queue(), ^(int token) {
@@ -400,6 +422,9 @@ static void settings_install_screen_awake_observers(void)
             g_springboard_finished_startup_notify_token = NOTIFY_TOKEN_INVALID;
         }
 
+        // If the live loop tripped its 3-failure exit during a background
+        // window, the screen-wake darwin notifications won't fire (the screen
+        // never blanked) and the loop stays dead. Re-arm on app foreground.
         [[NSNotificationCenter defaultCenter] addObserverForName:UIApplicationDidBecomeActiveNotification
                                                           object:nil
                                                            queue:[NSOperationQueue mainQueue]
@@ -433,6 +458,10 @@ static void settings_end_statbar_background_task_async(const char *reason)
     }
 }
 
+// Bridge the foreground -> background transition with a short explicit
+// UIBackgroundTask. DSKeepAlive's audio background mode carries the ongoing
+// live feed; holding a UIBackgroundTask indefinitely trips UIKit's 30s watchdog
+// warning and can get the app terminated.
 static void settings_begin_statbar_background_task_async(const char *reason)
 {
     void (^beginTask)(void) = ^{
@@ -1016,6 +1045,8 @@ static void settings_start_statbar_live_loop(void)
     if (![d boolForKey:kSettingsStatBarEnabled]) return;
 
     if (__sync_lock_test_and_set(&g_statbar_live_running, 1)) {
+        // Log-once for the process lifetime; further "already running" hits
+        // during foreground/background lifecycle churn are pure noise.
         static volatile int loggedAlready = 0;
         if (__sync_bool_compare_and_swap(&loggedAlready, 0, 1)) {
             printf("[SETTINGS] StatBar live loop already running\n");
@@ -1167,6 +1198,8 @@ static void settings_apply_statbar_once_async(const char *reason)
             ok = statbar_apply_in_session([d boolForKey:kSettingsStatBarCelsius],
                                           [d boolForKey:kSettingsStatBarHideNet]);
         }
+        // Only log lifecycle applies that change result; a clean success on
+        // every foreground/background flip is noise.
         static volatile int lastResult = -1;
         int now = ok ? 1 : 0;
         if (now != lastResult) {
@@ -1374,6 +1407,11 @@ static void settings_start_axonlite_live_loop(void)
                    tick < kAxonLiteLiveMaxTicks) {
                 useconds_t intervalUS = settings_live_interval(kAxonLiteLiveIntervalUS,
                                                                kAxonLiteLiveBackgroundIntervalUS);
+                // While the screen is blank, SB tears down cover-sheet view
+                // controllers to free memory. Calling into our cached
+                // gAxonCLVC etc during that window risks dereferencing freed
+                // objects (the PAC-fault path we keep hitting). Pause until
+                // the screen wakes; on wake the loop re-finds CLVC fresh.
                 if (!settings_statbar_screen_awake()) {
                     if (!pausedForSleep) {
                         pausedForSleep = YES;
@@ -1388,6 +1426,9 @@ static void settings_start_axonlite_live_loop(void)
                 if (pausedForSleep) {
                     pausedForSleep = NO;
                     printf("[SETTINGS] Axon Lite resumed after screen wake\n");
+                    // SB likely rebuilt the cover sheet during the blank
+                    // window; the cached CLVC we held is stale. Drop it so
+                    // the next tick walks the windows again.
                     axonlite_forget_remote_state();
                 }
 
@@ -1770,8 +1811,9 @@ void settings_register_defaults(void)
         kSettingsRSSIDisplayCell:    @YES,
 
         kSettingsAxonLiteEnabled: @NO,
-        kSettingsLogUploadEnabled: @NO,
     }];
+    // Signal Readouts is temporarily blocked from installation because its
+    // live RemoteCall refresh still interferes with other SpringBoard tweaks.
     if ([defaults boolForKey:kSettingsRSSIDisplayEnabled]) {
         [defaults setBool:NO forKey:kSettingsRSSIDisplayEnabled];
         [defaults synchronize];
@@ -1986,6 +2028,11 @@ void settings_run_actions(void)
 
                     if (runAxonLite) {
                         settings_progress(&step, total, "Starting Axon Lite notification hub");
+                        // First call: force the cover-sheet chain to
+                        // materialize and bind data sources.
+                        // Subsequent calls: let the now-populated CLVC
+                        // settle through the model → cache → bundles
+                        // pipeline before the user opens the lock screen.
                         bool ok = false;
                         for (int i = 0; i < 3; i++) {
                             bool tickOK = axonlite_apply_in_session();
@@ -2757,7 +2804,7 @@ static void downgrade_trigger_in_springboard(NSString *trackIdStr, NSString *ver
 - (CGFloat)tableView:(UITableView *)tableView heightForHeaderInSection:(NSInteger)section
 {
     if (!self.detailMode) {
-        if (section == RootSectionWarning) return 18.0;
+        if (section == RootSectionWarning) return 18.0; // breathing room above warning
         if ((RootSection)section == RootSectionTweakBundles  && self.tweakBundleRows.count  == 0) return CGFLOAT_MIN;
         if ((RootSection)section == RootSectionSystemBundles && self.systemBundleRows.count == 0) return CGFLOAT_MIN;
     }
@@ -2984,1206 +3031,298 @@ static void cyanide_upload_log_if_enabled(void) {
     [self presentViewController:vc animated:YES completion:nil];
 }
 
-static void settings_prepare_for_respring_sync(void);
-
-void settings_destroy_springboard_remote_call(void);
-
-typedef NS_ENUM(NSInteger, SettingsSection);
-typedef NS_ENUM(NSInteger, RootSection);
-
-@interface AppListViewController : UITableViewController
-@property (nonatomic, strong) NSArray *apps;
-@end
-
-extern bool remote_write(uint64_t remote_addr, const void *buffer, uint64_t size);
-
-static uint64_t downgrade_remote_alloc_str(const char *str) {
-    if (!str) return 0;
-    uint64_t len = strlen(str) + 1;
-    uint64_t buf = do_remote_call_stable(1000, "malloc", len, 0, 0, 0, 0, 0, 0, 0);
-    if (buf) {
-        remote_write(buf, str, len);
-    }
-    return buf;
-}
-
-static uint64_t remote_objc_getClass(const char *className) {
-    uint64_t strPtr = downgrade_remote_alloc_str(className);
-    if (!strPtr) return 0;
-    uint64_t cls = do_remote_call_stable(1000, "objc_getClass", strPtr, 0, 0, 0, 0, 0, 0, 0);
-    do_remote_call_stable(1000, "free", strPtr, 0, 0, 0, 0, 0, 0, 0);
-    return cls;
-}
-
-static uint64_t remote_sel_registerName(const char *selName) {
-    uint64_t strPtr = downgrade_remote_alloc_str(selName);
-    if (!strPtr) return 0;
-    uint64_t sel = do_remote_call_stable(1000, "sel_registerName", strPtr, 0, 0, 0, 0, 0, 0, 0);
-    do_remote_call_stable(1000, "free", strPtr, 0, 0, 0, 0, 0, 0, 0);
-    return sel;
-}
-
-static void downgrade_trigger_in_springboard(NSString *trackIdStr, NSString *versionIdStr) {
-    dispatch_async(dispatch_get_global_queue(0, 0), ^{
-        log_session_begin();
-        long long trackId = [trackIdStr longLongValue];
-        long long versionId = [versionIdStr longLongValue];
-        log_user("[DOWNGRADE] Requesting downgrade (Track: %lld, Version: %lld)...\n", trackId, versionId);
-        if (!settings_ensure_kexploit()) {
-            log_user("[DOWNGRADE] Failed: kernel primitives not acquired.\n");
-            log_session_end();
-            return;
-        }
-        @synchronized (settings_rc_lock()) {
-            if (!settings_ensure_springboard_remote_call_locked()) {
-                log_user("[DOWNGRADE] Failed to attach to SpringBoard.\n");
-                log_session_end();
-                return;
-            }
-            int sbx = escape_sbx_demo2_in_session();
-            if (sbx == 0) {
-                log_user("[DOWNGRADE] Sandbox extension consumed by SpringBoard.\n");
-            } else {
-                log_user("[WARN] Sandbox escape failed or already active (%d).\n", sbx);
-            }
-            log_user("[DOWNGRADE] Loading StoreKitUI framework into SpringBoard...\n");
-            uint64_t frameworkPathPtr = downgrade_remote_alloc_str("/System/Library/PrivateFrameworks/StoreKitUI.framework/StoreKitUI");
-            if (!frameworkPathPtr) {
-                log_user("[DOWNGRADE] ERROR: Failed to allocate memory in SpringBoard.\n");
-                log_session_end();
-                return;
-            }
-            uint64_t handle = do_remote_call_stable(1000, "dlopen", frameworkPathPtr, 9, 0, 0, 0, 0, 0, 0);
-            do_remote_call_stable(1000, "free", frameworkPathPtr, 0, 0, 0, 0, 0, 0, 0);
-            if (!handle) {
-                log_user("[DOWNGRADE] ERROR: SpringBoard failed to dlopen StoreKitUI.\n");
-                log_session_end();
-                return;
-            }
-            log_user("[DOWNGRADE] Constructing SKUI objects...\n");
-            NSString *adamIdStr = [NSString stringWithFormat:@"%lld", trackId];
-            NSString *buyParamsStr = [NSString stringWithFormat:@"productType=C&price=0&salableAdamId=%lld&pricingParameters=pricingParameter&appExtVrsId=%lld&clientBuyId=1&installed=0&trolled=1", trackId, versionId];
-            uint64_t adamIdCStrPtr = downgrade_remote_alloc_str(adamIdStr.UTF8String);
-            uint64_t paramsCStrPtr = downgrade_remote_alloc_str(buyParamsStr.UTF8String);
-            uint64_t kindCStrPtr = downgrade_remote_alloc_str("iosSoftware");
-            uint64_t buyParamsKeyCStrPtr = downgrade_remote_alloc_str("buyParams");
-            uint64_t itemOfferKeyCStrPtr = downgrade_remote_alloc_str("_itemOffer");
-            uint64_t kindKeyCStrPtr = downgrade_remote_alloc_str("_itemKindString");
-            uint64_t verKeyCStrPtr = downgrade_remote_alloc_str("_versionIdentifier");
-            uint64_t nsstringClass = remote_objc_getClass("NSString");
-            uint64_t stringWithUTF8StringSel = remote_sel_registerName("stringWithUTF8String:");
-            uint64_t adamIdNS = do_remote_call_stable(1000, "objc_msgSend", nsstringClass, stringWithUTF8StringSel, adamIdCStrPtr, 0, 0, 0, 0, 0);
-            uint64_t paramsNS = do_remote_call_stable(1000, "objc_msgSend", nsstringClass, stringWithUTF8StringSel, paramsCStrPtr, 0, 0, 0, 0, 0);
-            uint64_t kindNS = do_remote_call_stable(1000, "objc_msgSend", nsstringClass, stringWithUTF8StringSel, kindCStrPtr, 0, 0, 0, 0, 0);
-            uint64_t buyParamsKeyNS = do_remote_call_stable(1000, "objc_msgSend", nsstringClass, stringWithUTF8StringSel, buyParamsKeyCStrPtr, 0, 0, 0, 0, 0);
-            uint64_t itemOfferKeyNS = do_remote_call_stable(1000, "objc_msgSend", nsstringClass, stringWithUTF8StringSel, itemOfferKeyCStrPtr, 0, 0, 0, 0, 0);
-            uint64_t kindKeyNS = do_remote_call_stable(1000, "objc_msgSend", nsstringClass, stringWithUTF8StringSel, kindKeyCStrPtr, 0, 0, 0, 0, 0);
-            uint64_t verKeyNS = do_remote_call_stable(1000, "objc_msgSend", nsstringClass, stringWithUTF8StringSel, verKeyCStrPtr, 0, 0, 0, 0, 0);
-            uint64_t nsnumberClass = remote_objc_getClass("NSNumber");
-            uint64_t numberWithLongLongSel = remote_sel_registerName("numberWithLongLong:");
-            uint64_t versionNSNum = do_remote_call_stable(1000, "objc_msgSend", nsnumberClass, numberWithLongLongSel, versionId, 0, 0, 0, 0, 0);
-            uint64_t nsdictClass = remote_objc_getClass("NSDictionary");
-            uint64_t dictWithObjectForKeySel = remote_sel_registerName("dictionaryWithObject:forKey:");
-            uint64_t offerDict = do_remote_call_stable(1000, "objc_msgSend", nsdictClass, dictWithObjectForKeySel, paramsNS, buyParamsKeyNS, 0, 0, 0, 0);
-            uint64_t itemDict = do_remote_call_stable(1000, "objc_msgSend", nsdictClass, dictWithObjectForKeySel, adamIdNS, itemOfferKeyNS, 0, 0, 0, 0);
-            uint64_t allocSel = remote_sel_registerName("alloc");
-            uint64_t initDictSel = remote_sel_registerName("initWithLookupDictionary:");
-            uint64_t offerClass = remote_objc_getClass("SKUIItemOffer");
-            uint64_t offerAlloc = do_remote_call_stable(1000, "objc_msgSend", offerClass, allocSel, 0, 0, 0, 0, 0, 0);
-            uint64_t offerObj = do_remote_call_stable(1000, "objc_msgSend", offerAlloc, initDictSel, offerDict, 0, 0, 0, 0, 0);
-            uint64_t itemClass = remote_objc_getClass("SKUIItem");
-            uint64_t itemAlloc = do_remote_call_stable(1000, "objc_msgSend", itemClass, allocSel, 0, 0, 0, 0, 0, 0);
-            uint64_t itemObj = do_remote_call_stable(1000, "objc_msgSend", itemAlloc, initDictSel, itemDict, 0, 0, 0, 0, 0);
-            if (!offerObj || !itemObj) {
-                log_user("[DOWNGRADE] ERROR: Failed to instantiate SKUI items.\n");
-                log_session_end();
-                return;
-            }
-            uint64_t setValueForKeySel = remote_sel_registerName("setValue:forKey:");
-            do_remote_call_stable(1000, "objc_msgSend", itemObj, setValueForKeySel, offerObj, itemOfferKeyNS, 0, 0, 0, 0);
-            do_remote_call_stable(1000, "objc_msgSend", itemObj, setValueForKeySel, kindNS, kindKeyNS, 0, 0, 0, 0);
-            do_remote_call_stable(1000, "objc_msgSend", itemObj, setValueForKeySel, versionNSNum, verKeyNS, 0, 0, 0, 0);
-            uint64_t contextClass = remote_objc_getClass("SKUIClientContext");
-            uint64_t defContextSel = remote_sel_registerName("defaultContext");
-            uint64_t contextObj = do_remote_call_stable(1000, "objc_msgSend", contextClass, defContextSel, 0, 0, 0, 0, 0, 0);
-            uint64_t centerClass = remote_objc_getClass("SKUIItemStateCenter");
-            uint64_t defCenterSel = remote_sel_registerName("defaultCenter");
-            uint64_t centerObj = do_remote_call_stable(1000, "objc_msgSend", centerClass, defCenterSel, 0, 0, 0, 0, 0, 0);
-            uint64_t nsarrayClass = remote_objc_getClass("NSArray");
-            uint64_t arrayWithObjectSel = remote_sel_registerName("arrayWithObject:");
-            uint64_t itemsArray = do_remote_call_stable(1000, "objc_msgSend", nsarrayClass, arrayWithObjectSel, itemObj, 0, 0, 0, 0, 0);
-            uint64_t newPurchasesSel = remote_sel_registerName("_newPurchasesWithItems:");
-            uint64_t purchasesObj = do_remote_call_stable(1000, "objc_msgSend", centerObj, newPurchasesSel, itemsArray, 0, 0, 0, 0, 0);
-            log_user("[DOWNGRADE] Sending purchase request to App Store daemon...\n");
-            uint64_t performPurchasesSel = remote_sel_registerName("_performPurchases:hasBundlePurchase:withClientContext:completionBlock:");
-            do_remote_call_stable(1000, "objc_msgSend", centerObj, performPurchasesSel, purchasesObj, 0, contextObj, 0, 0, 0);
-            do_remote_call_stable(1000, "free", adamIdCStrPtr, 0, 0, 0, 0, 0, 0, 0);
-            do_remote_call_stable(1000, "free", paramsCStrPtr, 0, 0, 0, 0, 0, 0, 0);
-            do_remote_call_stable(1000, "free", kindCStrPtr, 0, 0, 0, 0, 0, 0, 0);
-            do_remote_call_stable(1000, "free", buyParamsKeyCStrPtr, 0, 0, 0, 0, 0, 0, 0);
-            do_remote_call_stable(1000, "free", itemOfferKeyCStrPtr, 0, 0, 0, 0, 0, 0, 0);
-            do_remote_call_stable(1000, "free", kindKeyCStrPtr, 0, 0, 0, 0, 0, 0, 0);
-            do_remote_call_stable(1000, "free", verKeyCStrPtr, 0, 0, 0, 0, 0, 0, 0);
-            log_user("[OK] Payload executed via RemoteCall! Please check your Home Screen for the downloading App.\n");
-        }
-        log_session_end();
-        dispatch_async(dispatch_get_main_queue(), ^{
-            [[NSNotificationCenter defaultCenter] postNotificationName:kSettingsActionsDidCompleteNotification object:nil];
-        });
-    });
-}
-
-@implementation AppListViewController
-- (void)viewDidLoad {
-    [super viewDidLoad];
-    self.title = @"Select App to Downgrade";
-    self.tableView.rowHeight = 60;
-    dispatch_async(dispatch_get_global_queue(0, 0), ^{
-        if (!g_springboard_sandbox_escaped) {
-            escape_sbx_demo2();
-        }
-        NSString *appsPath = @"/var/containers/Bundle/Application";
-        NSFileManager *fm = [NSFileManager defaultManager];
-        NSArray *appDirs = [fm contentsOfDirectoryAtPath:appsPath error:nil];
-        NSMutableArray *userApps = [NSMutableArray array];
-        for (NSString *uuidDir in appDirs) {
-            NSString *appGroupPath = [appsPath stringByAppendingPathComponent:uuidDir];
-            NSArray *subContents = [fm contentsOfDirectoryAtPath:appGroupPath error:nil];
-            for (NSString *sub in subContents) {
-                if ([sub hasSuffix:@".app"]) {
-                    NSString *appBundlePath = [appGroupPath stringByAppendingPathComponent:sub];
-                    NSString *infoPlistPath = [appBundlePath stringByAppendingPathComponent:@"Info.plist"];
-                    NSDictionary *info = [NSDictionary dictionaryWithContentsOfFile:infoPlistPath];
-                    if (info && info[@"CFBundleIdentifier"]) {
-                        [userApps addObject:info];
-                    }
-                }
-            }
-        }
-        [userApps sortUsingComparator:^NSComparisonResult(NSDictionary *obj1, NSDictionary *obj2) {
-            NSString *name1 = obj1[@"CFBundleDisplayName"] ?: obj1[@"CFBundleName"] ?: obj1[@"CFBundleIdentifier"];
-            NSString *name2 = obj2[@"CFBundleDisplayName"] ?: obj2[@"CFBundleName"] ?: obj2[@"CFBundleIdentifier"];
-            return [name1 localizedCaseInsensitiveCompare:name2];
-        }];
-        dispatch_async(dispatch_get_main_queue(), ^{
-            self.apps = userApps;
-            [self.tableView reloadData];
-        });
-    });
-}
-- (NSInteger)tableView:(UITableView *)tableView numberOfRowsInSection:(NSInteger)section {
-    return self.apps.count;
-}
-- (UITableViewCell *)tableView:(UITableView *)tableView cellForRowAtIndexPath:(NSIndexPath *)indexPath {
-    UITableViewCell *cell = [tableView dequeueReusableCellWithIdentifier:@"AppCell"];
-    if (!cell) cell = [[UITableViewCell alloc] initWithStyle:UITableViewCellStyleSubtitle reuseIdentifier:@"AppCell"];
-    NSDictionary *appInfo = self.apps[indexPath.row];
-    NSString *name = appInfo[@"CFBundleDisplayName"] ?: appInfo[@"CFBundleName"] ?: appInfo[@"CFBundleIdentifier"];
-    cell.textLabel.text = name;
-    cell.detailTextLabel.text = appInfo[@"CFBundleIdentifier"];
-    return cell;
-}
-- (NSArray<NSString *> *)downgrade_supportedAppStoreCountryCodes {
-    return @[@"cn", @"us", @"ae", @"ag", @"ai", @"al", @"am", @"ao", @"ar", @"at", @"au", @"az", @"bb", @"be", @"bf", @"bg", @"bh", @"bj", @"bm", @"bn", @"bo", @"br", @"bs", @"bt", @"bw", @"by", @"bz", @"ca", @"cg", @"ch", @"ci", @"cl", @"cm", @"co", @"cr", @"cv", @"cy", @"cz", @"de", @"dk", @"dm", @"do", @"dz", @"ec", @"ee", @"eg", @"es", @"fi", @"fj", @"fm", @"fr", @"gb", @"gd", @"gh", @"gm", @"gr", @"gt", @"gw", @"gy", @"hk", @"hn", @"hr", @"hu", @"id", @"ie", @"il", @"in", @"is", @"it", @"jm", @"jo", @"jp", @"ke", @"kg", @"kh", @"kn", @"kr", @"kw", @"ky", @"kz", @"la", @"lb", @"lc", @"lk", @"lr", @"lt", @"lu", @"lv", @"md", @"mg", @"mk", @"ml", @"mn", @"mo", @"mr", @"ms", @"mt", @"mu", @"mw", @"mx", @"my", @"na", @"ne", @"ng", @"ni", @"nl", @"no", @"np", @"nz", @"om", @"pa", @"pe", @"pg", @"ph", @"pk", @"pl", @"pt", @"pw", @"py", @"qa", @"ro", @"ru", @"rw", @"sa", @"sb", @"sc", @"se", @"sg", @"si", @"sk", @"sl", @"sn", @"sr", @"st", @"sv", @"sz", @"tc", @"td", @"th", @"tj", @"tm", @"tn", @"tr", @"tt", @"tw", @"tz", @"ua", @"ug", @"uy", @"uz", @"vc", @"ve", @"vg", @"vn", @"ye", @"za", @"zm", @"zw"];
-}
-- (void)downgrade_fetchTrackIDWithCountryCodes:(NSArray<NSString *> *)countryCodes index:(NSInteger)index bundleId:(NSString *)bundleId completion:(void(^)(long long trackId, NSError *err))completion {
-    if (index >= countryCodes.count) {
-        if (completion) {
-            completion(0, [NSError errorWithDomain:@"Downgrade" code:404 userInfo:@{NSLocalizedDescriptionKey: @"App not found in supported App Store regions."}]);
-        }
-        return;
-    }
-    NSString *countryCode = countryCodes[index];
-    NSString *urlString = [NSString stringWithFormat:@"https://itunes.apple.com/lookup?bundleId=%@&limit=1&media=software&country=%@", bundleId, countryCode];
-    NSURL *url = [NSURL URLWithString:urlString];
-    NSURLSessionDataTask *task = [[NSURLSession sharedSession] dataTaskWithRequest:[NSURLRequest requestWithURL:url] completionHandler:^(NSData *data, NSURLResponse *response, NSError *error) {
-        if (error || !data) {
-            dispatch_async(dispatch_get_main_queue(), ^{
-                [self downgrade_fetchTrackIDWithCountryCodes:countryCodes index:index + 1 bundleId:bundleId completion:completion];
-            });
-            return;
-        }
-        NSDictionary *json = [NSJSONSerialization JSONObjectWithData:data options:0 error:nil];
-        NSArray *results = json[@"results"];
-        if ([results isKindOfClass:[NSArray class]] && results.count > 0) {
-            long long trackId = [results.firstObject[@"trackId"] longLongValue];
-            dispatch_async(dispatch_get_main_queue(), ^{
-                if (completion) completion(trackId, nil);
-            });
-        } else {
-            dispatch_async(dispatch_get_main_queue(), ^{
-                [self downgrade_fetchTrackIDWithCountryCodes:countryCodes index:index + 1 bundleId:bundleId completion:completion];
-            });
-        }
-    }];
-    [task resume];
-}
-- (void)downgrade_fetchTrackIDForBundleID:(NSString *)bundleId completion:(void(^)(long long trackId, NSError *err))completion {
-    NSArray<NSString *> *countryCodes = [self downgrade_supportedAppStoreCountryCodes];
-    [self downgrade_fetchTrackIDWithCountryCodes:countryCodes index:0 bundleId:bundleId completion:completion];
-}
-- (void)downgrade_fetchVersionsForTrackID:(long long)trackId completion:(void(^)(NSArray *versions, NSError *err))completion {
-    NSURL *url = [NSURL URLWithString:[NSString stringWithFormat:@"https://apis.bilin.eu.org/history/%lld", trackId]];
-    NSURLSessionDataTask *task = [[NSURLSession sharedSession] dataTaskWithRequest:[NSURLRequest requestWithURL:url] completionHandler:^(NSData *data, NSURLResponse *response, NSError *error) {
-        dispatch_async(dispatch_get_main_queue(), ^{
-            if (error || !data) { if(completion) completion(nil, error); return; }
-            NSDictionary *json = [NSJSONSerialization JSONObjectWithData:data options:0 error:nil];
-            NSArray *versions = json[@"data"];
-            if ([versions isKindOfClass:[NSArray class]] && versions.count > 0) {
-                if (completion) completion(versions, nil);
-            } else {
-                if (completion) completion(nil, [NSError errorWithDomain:@"Downgrade" code:404 userInfo:@{NSLocalizedDescriptionKey: @"No historical versions found."}]);
-            }
-        });
-    }];
-    [task resume];
-}
-- (void)downgrade_presentVersionSelection:(NSArray *)versions trackID:(long long)trackId {
-    UIAlertController *alert = [UIAlertController alertControllerWithTitle:@"Select Version" message:@"Choose a version to downgrade to" preferredStyle:UIAlertControllerStyleActionSheet];
-    NSArray *sortedVersions = [versions sortedArrayUsingDescriptors:@[[NSSortDescriptor sortDescriptorWithKey:@"release_date" ascending:NO]]];
-    for (NSDictionary *ver in sortedVersions) {
-        NSString *bVer = ver[@"bundle_version"] ?: @"N/A";
-        NSString *extId = [ver[@"external_identifier"] stringValue] ?: @"";
-        NSString *title = extId.length > 0 ? [NSString stringWithFormat:@"%@ (%@)", bVer, extId] : bVer;
-        [alert addAction:[UIAlertAction actionWithTitle:title style:UIAlertActionStyleDefault handler:^(UIAlertAction * _Nonnull action) {
-            NSString *versionIdStr = [ver[@"external_identifier"] stringValue];
-            NSString *trackIdStr = [NSString stringWithFormat:@"%lld", trackId];
-            InstallProgressViewController *logVC = [[InstallProgressViewController alloc] init];
-            UINavigationController *logNav = [[UINavigationController alloc] initWithRootViewController:logVC];
-            logNav.modalPresentationStyle = UIModalPresentationAutomatic;
-            [self presentViewController:logNav animated:YES completion:^{
-                downgrade_trigger_in_springboard(trackIdStr, versionIdStr);
-            }];
-        }]];
-    }
-    [alert addAction:[UIAlertAction actionWithTitle:@"Cancel" style:UIAlertActionStyleCancel handler:nil]];
-    if ([[UIDevice currentDevice] userInterfaceIdiom] == UIUserInterfaceIdiomPad && alert.popoverPresentationController) {
-        alert.popoverPresentationController.sourceView = self.view;
-        alert.popoverPresentationController.sourceRect = CGRectMake(self.view.bounds.size.width / 2.0, self.view.bounds.size.height / 2.0, 1.0, 1.0);
-        alert.popoverPresentationController.permittedArrowDirections = 0;
-    }
-    [self presentViewController:alert animated:YES completion:nil];
-}
-- (void)tableView:(UITableView *)tableView didSelectRowAtIndexPath:(NSIndexPath *)indexPath {
-    [tableView deselectRowAtIndexPath:indexPath animated:YES];
-    NSDictionary *appInfo = self.apps[indexPath.row];
-    NSString *bundleId = appInfo[@"CFBundleIdentifier"];
-    UIAlertController *loadingAlert = [UIAlertController alertControllerWithTitle:@"Fetching Data..." message:@"Looking up App Store region and history..." preferredStyle:UIAlertControllerStyleAlert];
-    [self presentViewController:loadingAlert animated:YES completion:^{
-        [self downgrade_fetchTrackIDForBundleID:bundleId completion:^(long long trackId, NSError *err) {
-            if (err || trackId == 0) {
-                [loadingAlert dismissViewControllerAnimated:YES completion:^{
-                    UIAlertController *errAlert = [UIAlertController alertControllerWithTitle:@"Error" message:err.localizedDescription ?: @"Failed to get Track ID" preferredStyle:UIAlertControllerStyleAlert];
-                    [errAlert addAction:[UIAlertAction actionWithTitle:@"OK" style:UIAlertActionStyleCancel handler:nil]];
-                    [self presentViewController:errAlert animated:YES completion:nil];
-                }];
-                return;
-            }
-            [self downgrade_fetchVersionsForTrackID:trackId completion:^(NSArray *versions, NSError *verErr) {
-                [loadingAlert dismissViewControllerAnimated:YES completion:^{
-                    if (verErr || versions.count == 0) {
-                        UIAlertController *errAlert = [UIAlertController alertControllerWithTitle:@"Error" message:verErr.localizedDescription ?: @"Failed to get versions" preferredStyle:UIAlertControllerStyleAlert];
-                        [errAlert addAction:[UIAlertAction actionWithTitle:@"OK" style:UIAlertActionStyleCancel handler:nil]];
-                        [self presentViewController:errAlert animated:YES completion:nil];
-                        return;
-                    }
-                    [self downgrade_presentVersionSelection:versions trackID:trackId];
-                }];
-            }];
-        }];
-    }];
-}
-@end
-
-@interface SettingsViewController ()
-@property (nonatomic, strong) UISegmentedControl *powercuffSegmented;
-@property (nonatomic, assign) BOOL pendingManualActionsReload;
-@property (nonatomic, assign) BOOL detailMode;
-@property (nonatomic, assign) NSInteger underlyingSection;
-@property (nonatomic, copy)   NSString *bundleTitle;
-@end
-
-@implementation SettingsViewController
-
-- (instancetype)initWithCoder:(NSCoder *)coder
+- (UITableViewCell *)tableView:(UITableView *)tableView cellForRowAtIndexPath:(NSIndexPath *)indexPath
 {
-    if ((self = [super initWithCoder:coder])) {
-        _underlyingSection = NSIntegerMax;
-    }
-    return self;
-}
+    NSIndexPath *dequeuePath = indexPath;
 
-- (instancetype)initWithUnderlyingSection:(NSInteger)underlyingSection
-                              bundleTitle:(NSString *)bundleTitle
-{
-    if ((self = [super initWithStyle:UITableViewStyleInsetGrouped])) {
-        _detailMode = YES;
-        _underlyingSection = underlyingSection;
-        _bundleTitle = [bundleTitle copy];
-    }
-    return self;
-}
-
-- (void)viewDidLoad
-{
-    [super viewDidLoad];
-    self.title = self.detailMode ? (self.bundleTitle ?: @"Settings") : @"Settings";
-    self.tableView.contentInsetAdjustmentBehavior = UIScrollViewContentInsetAdjustmentAlways;
-    self.tableView.rowHeight                      = UITableViewAutomaticDimension;
-    self.tableView.estimatedRowHeight             = 44.0;
-    self.tableView.sectionHeaderHeight            = UITableViewAutomaticDimension;
-    self.tableView.estimatedSectionHeaderHeight   = 20.0;
-    self.tableView.sectionFooterHeight            = UITableViewAutomaticDimension;
-    self.tableView.estimatedSectionFooterHeight   = 10.0;
-    if (@available(iOS 15.0, *)) {
-        self.tableView.sectionHeaderTopPadding = 0.0;
-    }
-    [self.tableView registerClass:UITableViewCell.class forCellReuseIdentifier:@"toggle"];
-    [self.tableView registerClass:UITableViewCell.class forCellReuseIdentifier:@"stepper"];
-    [self.tableView registerClass:UITableViewCell.class forCellReuseIdentifier:@"segmented"];
-    [self.tableView registerClass:UITableViewCell.class forCellReuseIdentifier:@"action"];
-    [self.tableView registerClass:UITableViewCell.class forCellReuseIdentifier:@"button"];
-    [self.tableView registerClass:UITableViewCell.class forCellReuseIdentifier:@"warning"];
-    [self.tableView registerClass:UITableViewCell.class forCellReuseIdentifier:@"bundle"];
-    [self installInstallerReturnButtonIfNeeded];
-    [[NSNotificationCenter defaultCenter] addObserver:self
-                                             selector:@selector(remoteCallStateDidChange:)
-                                                 name:kSettingsRemoteCallStateDidChangeNotification
-                                               object:nil];
-}
-
-- (void)installInstallerReturnButtonIfNeeded
-{
-    if (!self.installerReturnPackageName) return;
-
-    UIButton *btn = [UIButton buttonWithType:UIButtonTypeSystem];
-    UIImageSymbolConfiguration *cfg = [UIImageSymbolConfiguration configurationWithPointSize:17.0 weight:UIImageSymbolWeightSemibold];
-    UIImage *chevron = [UIImage systemImageNamed:@"chevron.backward" withConfiguration:cfg];
-    [btn setImage:chevron forState:UIControlStateNormal];
-    [btn setTitle:[@" " stringByAppendingString:self.installerReturnPackageName] forState:UIControlStateNormal];
-    btn.titleLabel.font = [UIFont systemFontOfSize:17.0 weight:UIFontWeightRegular];
-    btn.tintColor = self.view.tintColor;
-    btn.contentEdgeInsets = UIEdgeInsetsMake(0, 0, 0, 4);
-    [btn addTarget:self action:@selector(returnToInstaller) forControlEvents:UIControlEventTouchUpInside];
-    [btn sizeToFit];
-
-    UIBarButtonItem *backItem = [[UIBarButtonItem alloc] initWithCustomView:btn];
-    self.navigationItem.leftBarButtonItem = backItem;
-    self.navigationItem.hidesBackButton = YES;
-}
-
-- (void)returnToInstaller
-{
-    UITabBarController *tab = self.tabBarController;
-    UINavigationController *settingsNav = self.navigationController;
-    NSUInteger installerIdx = NSNotFound;
-    for (NSUInteger i = 0; i < tab.viewControllers.count; i++) {
-        UIViewController *vc = tab.viewControllers[i];
-        if ([vc.tabBarItem.title isEqualToString:@"Installer"]) {
-            installerIdx = i;
-            break;
-        }
-    }
-    [settingsNav popToRootViewControllerAnimated:NO];
-    if (installerIdx != NSNotFound) {
-        tab.selectedIndex = installerIdx;
-    }
-}
-
-- (void)dealloc
-{
-    [[NSNotificationCenter defaultCenter] removeObserver:self];
-}
-
-- (void)viewWillAppear:(BOOL)animated
-{
-    [super viewWillAppear:animated];
-    [self reloadManualActions];
-}
-
-- (void)viewDidAppear:(BOOL)animated
-{
-    [super viewDidAppear:animated];
-    if (!self.pendingManualActionsReload) return;
-    self.pendingManualActionsReload = NO;
-    [self reloadManualActions];
-}
-
-- (void)remoteCallStateDidChange:(NSNotification *)notification
-{
-    [self reloadManualActions];
-}
-
-- (void)reloadManualActions
-{
-    if (!self.isViewLoaded) return;
-    if (self.detailMode) return;
-    if (!self.tableView.window) {
-        self.pendingManualActionsReload = YES;
-        return;
-    }
-    NSIndexSet *sections = [NSIndexSet indexSetWithIndex:RootSectionActions];
-    [self.tableView reloadSections:sections withRowAnimation:UITableViewRowAnimationNone];
-}
-
-- (UITableViewCell *)buildWarningCell:(UITableViewCell *)cell
-{
-    cell.selectionStyle = UITableViewCellSelectionStyleNone;
-    cell.textLabel.text = nil;
-    for (UIView *v in [cell.contentView.subviews copy]) [v removeFromSuperview];
-
-    UIImageView *icon = [[UIImageView alloc] initWithImage:[UIImage systemImageNamed:@"info.circle.fill"]];
-    icon.tintColor = UIColor.systemOrangeColor;
-    icon.contentMode = UIViewContentModeScaleAspectFit;
-    icon.translatesAutoresizingMaskIntoConstraints = NO;
-    [icon setContentHuggingPriority:UILayoutPriorityRequired forAxis:UILayoutConstraintAxisHorizontal];
-    [icon setContentCompressionResistancePriority:UILayoutPriorityRequired forAxis:UILayoutConstraintAxisHorizontal];
-
-    UILabel *label = [[UILabel alloc] init];
-    label.text = @"Not a traditional jailbreak: tweaks apply in real time over RemoteCall — no respring needed. Whenever a change kicks off an operation, a live log opens automatically; you can hide it any time. Force-quitting this app from the App Switcher stops live tweaks like StatBar and Axon Lite.";
-    label.textColor = UIColor.labelColor;
-    label.font = [UIFont systemFontOfSize:13 weight:UIFontWeightRegular];
-    label.numberOfLines = 0;
-    label.translatesAutoresizingMaskIntoConstraints = NO;
-
-    [cell.contentView addSubview:icon];
-    [cell.contentView addSubview:label];
-    UILayoutGuide *m = cell.contentView.layoutMarginsGuide;
-    [NSLayoutConstraint activateConstraints:@[
-        [icon.leadingAnchor   constraintEqualToAnchor:m.leadingAnchor],
-        [icon.centerYAnchor   constraintEqualToAnchor:label.centerYAnchor],
-        [icon.widthAnchor     constraintEqualToConstant:22],
-        [icon.heightAnchor    constraintEqualToConstant:22],
-        [label.leadingAnchor  constraintEqualToAnchor:icon.trailingAnchor constant:10],
-        [label.trailingAnchor constraintEqualToAnchor:m.trailingAnchor],
-        [label.topAnchor      constraintEqualToAnchor:m.topAnchor constant:4],
-        [label.bottomAnchor   constraintEqualToAnchor:m.bottomAnchor constant:-4],
-    ]];
-    return cell;
-}
-
-#pragma mark - Row models
-
-- (NSArray<NSDictionary *> *)launchRows
-{
-    return @[
-        @{ @"key": kSettingsAutoRunKexploit,    @"title": @"Auto-run kexploit on launch" },
-        @{ @"key": kSettingsRunSandboxEscape,   @"title": @"Sandbox escape (escape_sbx_demo2)" },
-        @{ @"key": kSettingsKeepAlive,          @"title": @"Keep app alive in background",
-           @"subtitle": @"Required for app-driven live tweaks to persist while minimized, including StatBar receiving fresh live data." },
-    ];
-}
-
-- (NSArray<NSDictionary *> *)sbcRows
-{
-    return @[
-        @{ @"kind": @"stepper", @"key": kSettingsSBCDockIcons,  @"title": @"Dock icons", @"min": @4, @"max": @7, @"default": @(kSBCDefaultDockIcons) },
-        @{ @"kind": @"stepper", @"key": kSettingsSBCCols,       @"title": @"Home columns", @"min": @3, @"max": @7, @"default": @(kSBCDefaultCols) },
-        @{ @"kind": @"stepper", @"key": kSettingsSBCRows,       @"title": @"Home rows", @"min": @4, @"max": @8, @"default": @(kSBCDefaultRows) },
-        @{ @"kind": @"toggle",  @"key": kSettingsSBCHideLabels, @"title": @"Hide icon labels" },
-        @{ @"kind": @"button",  @"title": @"Reset to Defaults" },
-    ];
-}
-
-- (NSArray<NSDictionary *> *)powercuffRows
-{
-    return @[
-        @{ @"kind": @"segmented", @"key": kSettingsPowercuffLevel,   @"title": @"Level" },
-    ];
-}
-
-- (NSArray<NSDictionary *> *)otaRows
-{
-    return @[];
-}
-
-- (NSArray<NSDictionary *> *)darkSwordTweakRows
-{
-    return @[];
-}
-
-- (NSArray<NSDictionary *> *)statbarRows
-{
-    return @[
-        @{ @"kind": @"toggle", @"key": kSettingsStatBarCelsius, @"title": @"Celsius" },
-        @{ @"kind": @"toggle", @"key": kSettingsStatBarHideNet, @"title": @"Hide network speed" },
-    ];
-}
-
-- (NSArray<NSDictionary *> *)rssiRows
-{
-    return @[
-        @{ @"kind": @"toggle", @"key": kSettingsRSSIDisplayWifi, @"title": @"WiFi (bar count)" },
-        @{ @"kind": @"toggle", @"key": kSettingsRSSIDisplayCell, @"title": @"Cellular (dBm)" },
-    ];
-}
-
-- (NSArray<NSDictionary *> *)axonLiteRows
-{
-    return @[];
-}
-
-+ (NSArray<NSDictionary<NSString *, NSString *> *> *)settingsSummaryForSection:(NSInteger)section
-{
-    NSUserDefaults *d = NSUserDefaults.standardUserDefaults;
-    NSMutableArray *out = [NSMutableArray array];
-    if (section == SectionSBC) {
-        [out addObject:@{@"title": @"Dock icons",       @"value": [@([d integerForKey:kSettingsSBCDockIcons])  stringValue]}];
-        [out addObject:@{@"title": @"Home columns",     @"value": [@([d integerForKey:kSettingsSBCCols])        stringValue]}];
-        [out addObject:@{@"title": @"Home rows",        @"value": [@([d integerForKey:kSettingsSBCRows])        stringValue]}];
-        [out addObject:@{@"title": @"Hide icon labels", @"value": [d boolForKey:kSettingsSBCHideLabels] ? @"On" : @"Off"}];
-    } else if (section == SectionStatBar) {
-        [out addObject:@{@"title": @"Celsius",          @"value": [d boolForKey:kSettingsStatBarCelsius] ? @"On" : @"Off"}];
-        [out addObject:@{@"title": @"Hide net speed",   @"value": [d boolForKey:kSettingsStatBarHideNet]  ? @"On" : @"Off"}];
-    } else if (section == SectionRSSI) {
-        [out addObject:@{@"title": @"WiFi (bar count)", @"value": [d boolForKey:kSettingsRSSIDisplayWifi] ? @"On" : @"Off"}];
-        [out addObject:@{@"title": @"Cellular (dBm)",   @"value": [d boolForKey:kSettingsRSSIDisplayCell] ? @"On" : @"Off"}];
-    } else if (section == SectionPowercuff) {
-        NSString *lvl = [d stringForKey:kSettingsPowercuffLevel] ?: @"heavy";
-        [out addObject:@{@"title": @"Level", @"value": lvl}];
-    }
-    return out;
-}
-
-- (NSArray<NSDictionary *> *)rowsForSection:(NSInteger)s
-{
-    switch (s) {
-        case SectionLaunch:    return self.launchRows;
-        case SectionSBC:       return self.sbcRows;
-        case SectionDarkSwordTweaks: return self.darkSwordTweakRows;
-        case SectionOTA:       return self.otaRows;
-        case SectionPowercuff: return self.powercuffRows;
-        case SectionStatBar:   return self.statbarRows;
-        case SectionRSSI:      return self.rssiRows;
-        case SectionAxonLite:  return self.axonLiteRows;
-        case SectionAppDowngrade: return @[];
-        default: return @[];
-    }
-}
-
-#pragma mark - Bundle rows (root mode)
-
-- (NSArray<NSDictionary *> *)allTweakBundleRows
-{
-    return @[
-        @{ @"title": @"Launch Options",     @"icon": @"bolt.fill",                          @"color": [UIColor systemRedColor],    @"section": @(SectionLaunch) },
-        @{ @"title": @"SBCustomizer",       @"icon": @"square.grid.3x3.fill",                @"color": [UIColor systemBlueColor],   @"section": @(SectionSBC) },
-        @{ @"title": @"StatBar",            @"icon": @"thermometer.medium",                  @"color": [UIColor systemRedColor],    @"section": @(SectionStatBar) },
-        @{ @"title": @"Signal Display",     @"icon": @"antenna.radiowaves.left.and.right",   @"color": [UIColor systemBlueColor],   @"section": @(SectionRSSI) },
-        @{ @"title": @"Axon Lite",          @"icon": @"bell.badge.fill",                     @"color": [UIColor systemRedColor],    @"section": @(SectionAxonLite) },
-        @{ @"title": @"Powercuff",          @"icon": @"bolt.slash.fill",                     @"color": [UIColor systemOrangeColor], @"section": @(SectionPowercuff) },
-        @{ @"title": @"SpringBoard Tweaks", @"icon": @"apps.iphone",                         @"color": [UIColor systemIndigoColor], @"section": @(SectionDarkSwordTweaks) },
-        @{ @"title": @"App Downgrade",      @"icon": @"arrow.down.app.fill",                 @"color": [UIColor systemPurpleColor], @"section": @(SectionAppDowngrade) },
-    ];
-}
-
-- (NSArray<NSDictionary *> *)allSystemBundleRows
-{
-    return @[
-        @{ @"title": @"OTA Updates", @"icon": @"icloud.slash.fill", @"color": [UIColor systemGrayColor], @"section": @(SectionOTA) },
-    ];
-}
-
-- (NSArray<NSDictionary *> *)filterBundles:(NSArray<NSDictionary *> *)bundles
-{
-    NSMutableArray<NSDictionary *> *out = [NSMutableArray array];
-    for (NSDictionary *bundle in bundles) {
-        NSInteger sec = [bundle[@"section"] integerValue];
-        if ([self rowsForSection:sec].count > 0 || sec == SectionAppDowngrade) {
-            [out addObject:bundle];
-        }
-    }
-    return out;
-}
-
-- (NSArray<NSDictionary *> *)tweakBundleRows
-{
-    return [self filterBundles:[self allTweakBundleRows]];
-}
-
-- (NSArray<NSDictionary *> *)systemBundleRows
-{
-    return [self filterBundles:[self allSystemBundleRows]];
-}
-
-- (NSArray<NSDictionary *> *)bundleRowsForRootSection:(RootSection)section
-{
-    if (section == RootSectionTweakBundles)  return self.tweakBundleRows;
-    if (section == RootSectionSystemBundles) return self.systemBundleRows;
-    return @[];
-}
-
-#pragma mark - Table data
-
-- (NSInteger)numberOfSectionsInTableView:(UITableView *)tableView
-{
-    return self.detailMode ? 1 : RootSectionCount;
-}
-
-- (NSInteger)tableView:(UITableView *)tableView numberOfRowsInSection:(NSInteger)section
-{
-    if (self.detailMode) {
-        return (NSInteger)[self rowsForSection:self.underlyingSection].count;
-    }
-    switch ((RootSection)section) {
-        case RootSectionWarning:        return 1;
-        case RootSectionActions:        return 4;
-        case RootSectionTweakBundles:   return (NSInteger)self.tweakBundleRows.count;
-        case RootSectionSystemBundles:  return (NSInteger)self.systemBundleRows.count;
-        case RootSectionAbout:          return 4;
-        case RootSectionCount:          return 0;
-    }
-    return 0;
-}
-
-- (NSString *)tableView:(UITableView *)tableView titleForHeaderInSection:(NSInteger)section
-{
-    if (self.detailMode) return nil;
-    switch ((RootSection)section) {
-        case RootSectionActions:        return @"Quick Actions";
-        case RootSectionTweakBundles:   return self.tweakBundleRows.count   > 0 ? @"Tweaks" : nil;
-        case RootSectionSystemBundles:  return self.systemBundleRows.count  > 0 ? @"System" : nil;
-        case RootSectionAbout:          return @"About";
-        default:                        return nil;
-    }
-}
-
-- (NSString *)tableView:(UITableView *)tableView titleForFooterInSection:(NSInteger)section
-{
-    if (!self.detailMode) return nil;
-    NSInteger s = self.underlyingSection;
-    if (s == SectionLaunch) {
-        return @"kexploit_opa334 runs once per app lifetime. Keep Alive applies only while Cyanide is minimized; an App Switcher kill still terminates the process.";
-    }
-    if (s == SectionSBC) {
-        return [NSString stringWithFormat:@"Stock iOS defaults: dock %ld, columns %ld, rows %ld.",
-                (long)kSBCDefaultDockIcons, (long)kSBCDefaultCols, (long)kSBCDefaultRows];
-    }
-    if (s == SectionDarkSwordTweaks) {
-        return @"Imported from DarkSword-Tweaks. These are SpringBoard runtime patches; turning one off only skips future applies.";
-    }
-    if (s == SectionOTA) {
-        return @"Edits launchd disabled.plist. A reboot or userspace restart is required for changes to take effect.";
-    }
-    if (s == SectionPowercuff) {
-        return @"Underclocks the CPU/GPU via thermalmonitord by simulating a thermal pressure level. Lasts until reboot. Heavier levels save battery at the cost of responsiveness.";
-    }
-    if (s == SectionStatBar) {
-        return @"Live overlay. When enabled, StatBar keeps a SpringBoard RemoteCall session open and refreshes once per second until toggled off.";
-    }
-    if (s == SectionRSSI) {
-        return @"Adds a UILabel as a sibling of each STUI signal view (no new UIWindow), refreshed every second. Cellular shows live RSRP dBm (sign implicit). WiFi shows the bar count (0-4); the wifid XPC dBm path crashed SpringBoard in prior tests.";
-    }
-    if (s == SectionAxonLite) {
-        return @"RemoteCall-only Axon port. It uses a live app-side loop rather than substrate hooks, so it lasts for the active Cyanide SpringBoard session.";
-    }
-    if (s == SectionAppDowngrade) {
-        return @"Injects a payload into SpringBoard to trigger an App Store download using SKUIItemStateCenter with a spoofed version ID, allowing app downgrades without a traditional jailbreak.";
-    }
-    return nil;
-}
-
-- (CGFloat)tableView:(UITableView *)tableView heightForHeaderInSection:(NSInteger)section
-{
     if (!self.detailMode) {
-        if (section == RootSectionWarning) return 18.0;
-        if ((RootSection)section == RootSectionTweakBundles  && self.tweakBundleRows.count  == 0) return CGFLOAT_MIN;
-        if ((RootSection)section == RootSectionSystemBundles && self.systemBundleRows.count == 0) return CGFLOAT_MIN;
-    }
-    return UITableViewAutomaticDimension;
-}
-
-- (CGFloat)tableView:(UITableView *)tableView heightForFooterInSection:(NSInteger)section
-{
-    if ([self tableView:tableView titleForFooterInSection:section].length > 0)
-        return UITableViewAutomaticDimension;
-    return 6.0;
-}
-
-#pragma mark - Icon badge
-
-+ (UIImage *)iconBadgeWithSymbol:(NSString *)symbol color:(UIColor *)color size:(CGFloat)size
-{
-    UIGraphicsImageRendererFormat *format = [UIGraphicsImageRendererFormat preferredFormat];
-    UIGraphicsImageRenderer *renderer = [[UIGraphicsImageRenderer alloc] initWithSize:CGSizeMake(size, size) format:format];
-    return [renderer imageWithActions:^(UIGraphicsImageRendererContext *ctx) {
-        CGFloat radius = size * (7.0 / 29.0);
-        UIBezierPath *path = [UIBezierPath bezierPathWithRoundedRect:CGRectMake(0, 0, size, size) cornerRadius:radius];
-        [color setFill];
-        [path fill];
-
-        UIImageSymbolConfiguration *cfg = [UIImageSymbolConfiguration configurationWithPointSize:size * 0.58 weight:UIImageSymbolWeightSemibold];
-        UIImage *symbolImage = [UIImage systemImageNamed:symbol withConfiguration:cfg];
-        if (symbolImage) {
-            UIImage *whiteIcon = [symbolImage imageWithTintColor:UIColor.whiteColor renderingMode:UIImageRenderingModeAlwaysOriginal];
-            CGFloat x = (size - whiteIcon.size.width) / 2.0;
-            CGFloat y = (size - whiteIcon.size.height) / 2.0;
-            [whiteIcon drawAtPoint:CGPointMake(x, y)];
+        switch ((RootSection)indexPath.section) {
+            case RootSectionWarning:
+                break;
+            case RootSectionActions:
+                indexPath = [NSIndexPath indexPathForRow:indexPath.row inSection:SectionActions];
+                break;
+            case RootSectionTweakBundles:
+                return [self buildBundleCellWithRow:self.tweakBundleRows[indexPath.row] tableView:tableView];
+            case RootSectionSystemBundles:
+                return [self buildBundleCellWithRow:self.systemBundleRows[indexPath.row] tableView:tableView];
+            case RootSectionAbout:
+                return [self buildAboutCellAtRow:indexPath.row tableView:tableView];
+            case RootSectionCount:
+                return [[UITableViewCell alloc] init];
         }
-    }];
-}
-
-#pragma mark - Cells
-
-- (UITableViewCell *)buildBundleCellWithRow:(NSDictionary *)row tableView:(UITableView *)tableView
-{
-    UITableViewCell *cell = [tableView dequeueReusableCellWithIdentifier:@"bundle"];
-    if (!cell) {
-        cell = [[UITableViewCell alloc] initWithStyle:UITableViewCellStyleDefault reuseIdentifier:@"bundle"];
-    }
-    cell.imageView.image = [SettingsViewController iconBadgeWithSymbol:row[@"icon"] color:row[@"color"] size:29.0];
-    cell.textLabel.text = row[@"title"];
-    cell.textLabel.font = [UIFont systemFontOfSize:17.0];
-    cell.textLabel.textColor = UIColor.labelColor;
-    cell.accessoryType = UITableViewCellAccessoryDisclosureIndicator;
-    cell.selectionStyle = UITableViewCellSelectionStyleDefault;
-    return cell;
-}
-
-- (UITableViewCell *)buildAboutCellAtRow:(NSInteger)row tableView:(UITableView *)tableView
-{
-    UITableViewCell *cell = [tableView dequeueReusableCellWithIdentifier:@"about"];
-    if (!cell) {
-        cell = [[UITableViewCell alloc] initWithStyle:UITableViewCellStyleValue1 reuseIdentifier:@"about"];
-    }
-    cell.accessoryType = UITableViewCellAccessoryDisclosureIndicator;
-    cell.selectionStyle = UITableViewCellSelectionStyleDefault;
-    cell.textLabel.font = [UIFont systemFontOfSize:17.0];
-    cell.textLabel.textColor = UIColor.labelColor;
-    cell.detailTextLabel.textColor = UIColor.secondaryLabelColor;
-    cell.detailTextLabel.text = nil;
-
-    if (row == 0) {
-        cell.imageView.image = [SettingsViewController iconBadgeWithSymbol:@"at" color:UIColor.systemBlueColor size:29.0];
-        cell.textLabel.text = @"Twitter";
-        cell.detailTextLabel.text = @"@zeroxjf";
-    } else if (row == 1) {
-        cell.imageView.image = [SettingsViewController iconBadgeWithSymbol:@"doc.text.magnifyingglass" color:UIColor.systemGrayColor size:29.0];
-        cell.textLabel.text = @"View Log";
-    } else if (row == 2) {
-        cell.imageView.image = [SettingsViewController iconBadgeWithSymbol:@"square.and.arrow.up" color:UIColor.systemGreenColor size:29.0];
-        cell.textLabel.text = @"Share Log";
     } else {
-        cell.imageView.image = [SettingsViewController iconBadgeWithSymbol:@"icloud.and.arrow.up" color:UIColor.systemIndigoColor size:29.0];
-        cell.textLabel.text = @"Auto-Upload Logs";
-        cell.accessoryType = UITableViewCellAccessoryNone;
+        indexPath = [NSIndexPath indexPathForRow:indexPath.row inSection:self.underlyingSection];
+    }
+
+    if (indexPath.section == SectionWarning) {
+        UITableViewCell *cell = [tableView dequeueReusableCellWithIdentifier:@"warning" forIndexPath:dequeuePath];
+        return [self buildWarningCell:cell];
+    }
+    if (indexPath.section == SectionActions) {
+        UITableViewCell *cell = [tableView dequeueReusableCellWithIdentifier:@"action" forIndexPath:dequeuePath];
+        cell.textLabel.text = nil;
+        for (UIView *v in [cell.contentView.subviews copy]) [v removeFromSuperview];
+
+        BOOL supported = settings_device_supported();
+        BOOL cleanupEnabled = supported && (g_kexploit_done ||
+                                            g_springboard_rc_ready ||
+                                            remote_call_has_local_state());
+        BOOL anyInstalledOrQueued = NO;
+        for (Package *p in [PackageCatalog allPackages]) {
+            if (p.isInstalled || p.isQueuedForApply) { anyInstalledOrQueued = YES; break; }
+        }
+        if (!anyInstalledOrQueued) {
+            anyInstalledOrQueued = [[PackageQueue sharedQueue] pendingCount] > 0;
+        }
+        BOOL rowEnabled = supported;
+        if (indexPath.row == 1) rowEnabled = cleanupEnabled;
+        if (indexPath.row == 3) rowEnabled = anyInstalledOrQueued;
+
+        UILabel *primary = [[UILabel alloc] init];
+        primary.translatesAutoresizingMaskIntoConstraints = NO;
+        primary.textAlignment = NSTextAlignmentCenter;
+        if (indexPath.row == 0) {
+            primary.text = @"Run / Apply Tweaks";
+            primary.textColor = supported ? self.view.tintColor : UIColor.tertiaryLabelColor;
+            primary.font = [UIFont systemFontOfSize:18 weight:UIFontWeightSemibold];
+        } else if (indexPath.row == 1) {
+            primary.text = @"Clean Up";
+            primary.textColor = cleanupEnabled ? UIColor.systemRedColor : UIColor.tertiaryLabelColor;
+            primary.font = [UIFont systemFontOfSize:17];
+        } else if (indexPath.row == 2) {
+            primary.text = @"Respring";
+            primary.textColor = supported ? UIColor.systemOrangeColor : UIColor.tertiaryLabelColor;
+            primary.font = [UIFont systemFontOfSize:17];
+        } else {
+            primary.text = @"Reset All Packages";
+            primary.textColor = anyInstalledOrQueued ? UIColor.systemRedColor : UIColor.tertiaryLabelColor;
+            primary.font = [UIFont systemFontOfSize:17];
+        }
+        [cell.contentView addSubview:primary];
+        if (!rowEnabled) {
+            cell.selectionStyle = UITableViewCellSelectionStyleNone;
+            cell.userInteractionEnabled = NO;
+        } else {
+            cell.selectionStyle = UITableViewCellSelectionStyleDefault;
+            cell.userInteractionEnabled = YES;
+        }
+
+        UILayoutGuide *m = cell.contentView.layoutMarginsGuide;
+        NSString *detailText = nil;
+        UIColor *detailColor = UIColor.secondaryLabelColor;
+        if (indexPath.row == 0 && !supported) {
+            detailText = settings_unsupported_message();
+            detailColor = UIColor.systemRedColor;
+        } else if (indexPath.row == 1) {
+            detailText = cleanupEnabled
+                ? @"Stops live SpringBoard sessions, parks the KRW socket state, and closes this app's local KRW fds. Next run tries launchd recovery first."
+                : @"No local KRW session.";
+            detailColor = cleanupEnabled ? UIColor.secondaryLabelColor : UIColor.tertiaryLabelColor;
+        } else if (indexPath.row == 2) {
+            detailText = @"Clean up is auto run prior to respring to ensure a clean state.";
+            detailColor = supported ? UIColor.secondaryLabelColor : UIColor.tertiaryLabelColor;
+        } else if (indexPath.row == 3) {
+            detailText = anyInstalledOrQueued
+                ? @"Uninstall every package and clear the pending queue. SpringBoard patches already applied this session stay until respring/reboot."
+                : @"Nothing installed or queued.";
+            detailColor = anyInstalledOrQueued ? UIColor.secondaryLabelColor : UIColor.tertiaryLabelColor;
+        }
+        if (detailText) {
+            UILabel *detail = [[UILabel alloc] init];
+            detail.translatesAutoresizingMaskIntoConstraints = NO;
+            detail.text = detailText;
+            detail.textColor = detailColor;
+            detail.font = [UIFont systemFontOfSize:12];
+            detail.textAlignment = NSTextAlignmentCenter;
+            detail.numberOfLines = 0;
+            [cell.contentView addSubview:detail];
+            [NSLayoutConstraint activateConstraints:@[
+                [primary.leadingAnchor  constraintEqualToAnchor:m.leadingAnchor],
+                [primary.trailingAnchor constraintEqualToAnchor:m.trailingAnchor],
+                [primary.topAnchor      constraintEqualToAnchor:m.topAnchor constant:2],
+                [detail.leadingAnchor   constraintEqualToAnchor:m.leadingAnchor],
+                [detail.trailingAnchor  constraintEqualToAnchor:m.trailingAnchor],
+                [detail.topAnchor       constraintEqualToAnchor:primary.bottomAnchor constant:2],
+                [detail.bottomAnchor    constraintEqualToAnchor:m.bottomAnchor constant:-2],
+            ]];
+        } else {
+            [NSLayoutConstraint activateConstraints:@[
+                [primary.leadingAnchor  constraintEqualToAnchor:m.leadingAnchor],
+                [primary.trailingAnchor constraintEqualToAnchor:m.trailingAnchor],
+                [primary.topAnchor      constraintEqualToAnchor:m.topAnchor],
+                [primary.bottomAnchor   constraintEqualToAnchor:m.bottomAnchor],
+            ]];
+        }
+        return cell;
+    }
+
+    NSDictionary *row = [self rowsForSection:indexPath.section][indexPath.row];
+    NSString *kind = row[@"kind"] ?: @"toggle";
+    NSUserDefaults *d = [NSUserDefaults standardUserDefaults];
+    BOOL supported = settings_device_supported();
+
+    if ([kind isEqualToString:@"button"]) {
+        BOOL rowSupported = supported || indexPath.section == SectionOTA;
+        UITableViewCell *cell = [tableView dequeueReusableCellWithIdentifier:@"button" forIndexPath:dequeuePath];
+        cell.selectionStyle = rowSupported ? UITableViewCellSelectionStyleDefault : UITableViewCellSelectionStyleNone;
+        cell.userInteractionEnabled = rowSupported;
+        cell.accessoryView = nil;
+        cell.textLabel.text = row[@"title"];
+        cell.textLabel.textAlignment = NSTextAlignmentCenter;
+        cell.textLabel.textColor = rowSupported
+            ? ([row[@"destructive"] boolValue] ? UIColor.systemRedColor : self.view.tintColor)
+            : UIColor.tertiaryLabelColor;
+        return cell;
+    }
+
+    if ([kind isEqualToString:@"stepper"]) {
+        UITableViewCell *cell = [tableView dequeueReusableCellWithIdentifier:@"stepper" forIndexPath:dequeuePath];
         cell.selectionStyle = UITableViewCellSelectionStyleNone;
-        UISwitch *sw = [[UISwitch alloc] init];
-        sw.on = [[NSUserDefaults standardUserDefaults] boolForKey:kSettingsLogUploadEnabled];
-        [sw addTarget:self action:@selector(logUploadSwitchChanged:) forControlEvents:UIControlEventValueChanged];
-        cell.accessoryView = sw;
+        cell.textLabel.textAlignment = NSTextAlignmentNatural;
+        cell.textLabel.textColor = supported ? UIColor.labelColor : UIColor.tertiaryLabelColor;
+        NSInteger value = [d integerForKey:row[@"key"]];
+        cell.textLabel.text = [NSString stringWithFormat:@"%@: %ld", row[@"title"], (long)value];
+        UIStepper *stp = [[UIStepper alloc] init];
+        stp.minimumValue = [row[@"min"] doubleValue];
+        stp.maximumValue = [row[@"max"] doubleValue];
+        stp.stepValue = 1;
+        stp.value = (double)value;
+        stp.enabled = supported;
+        stp.tag = (indexPath.section << 16) | indexPath.row;
+        [stp addTarget:self action:@selector(stepperChanged:) forControlEvents:UIControlEventValueChanged];
+        cell.accessoryView = stp;
+        return cell;
     }
-    return cell;
-}
 
-- (void)logUploadSwitchChanged:(UISwitch *)sw {
-    [[NSUserDefaults standardUserDefaults] setBool:sw.isOn forKey:kSettingsLogUploadEnabled];
-}
+    if ([kind isEqualToString:@"segmented"]) {
+        UITableViewCell *cell = [tableView dequeueReusableCellWithIdentifier:@"segmented" forIndexPath:dequeuePath];
+        cell.selectionStyle = UITableViewCellSelectionStyleNone;
+        cell.textLabel.text = nil;
+        for (UIView *v in [cell.contentView.subviews copy]) [v removeFromSuperview];
+        UISegmentedControl *seg = [[UISegmentedControl alloc] initWithItems:powercuff_levels()];
+        seg.translatesAutoresizingMaskIntoConstraints = NO;
+        NSString *cur = [d stringForKey:row[@"key"]] ?: @"heavy";
+        NSUInteger idx = [powercuff_levels() indexOfObject:cur];
+        if (idx == NSNotFound) idx = 4;
+        seg.selectedSegmentIndex = (NSInteger)idx;
+        seg.enabled = supported;
+        [seg addTarget:self action:@selector(powercuffSegChanged:) forControlEvents:UIControlEventValueChanged];
+        [cell.contentView addSubview:seg];
+        [NSLayoutConstraint activateConstraints:@[
+            [seg.leadingAnchor  constraintEqualToAnchor:cell.contentView.layoutMarginsGuide.leadingAnchor],
+            [seg.trailingAnchor constraintEqualToAnchor:cell.contentView.layoutMarginsGuide.trailingAnchor],
+            [seg.topAnchor      constraintEqualToAnchor:cell.contentView.layoutMarginsGuide.topAnchor],
+            [seg.bottomAnchor   constraintEqualToAnchor:cell.contentView.layoutMarginsGuide.bottomAnchor],
+        ]];
+        return cell;
+    }
 
-- (void)openTwitter
-{
-    NSURL *url = [NSURL URLWithString:@"https://twitter.com/zeroxjf"];
-    if (url) [[UIApplication sharedApplication] openURL:url options:@{} completionHandler:nil];
-}
-
-- (void)openViewLog
-{
-    NSString *logPath = log_most_recent_session_path();
-    NSString *text;
-    if (!logPath) {
-        text = @"No log yet. Run a chain at least once.";
+    UITableViewCell *cell = [tableView dequeueReusableCellWithIdentifier:@"toggle" forIndexPath:dequeuePath];
+    cell.selectionStyle = UITableViewCellSelectionStyleNone;
+    NSString *subtitle = row[@"subtitle"];
+    if (subtitle.length > 0) {
+        UIListContentConfiguration *config = [UIListContentConfiguration cellConfiguration];
+        config.text = row[@"title"];
+        config.secondaryText = subtitle;
+        config.textToSecondaryTextVerticalPadding = 3;
+        config.textProperties.color = supported ? UIColor.labelColor : UIColor.tertiaryLabelColor;
+        config.secondaryTextProperties.color = supported ? UIColor.secondaryLabelColor : UIColor.tertiaryLabelColor;
+        config.secondaryTextProperties.font = [UIFont systemFontOfSize:12];
+        config.secondaryTextProperties.numberOfLines = 0;
+        cell.contentConfiguration = config;
     } else {
-        NSError *err = nil;
-        text = [NSString stringWithContentsOfFile:logPath encoding:NSUTF8StringEncoding error:&err];
-        if (!text) text = [NSString stringWithFormat:@"Failed to read log: %@", err.localizedDescription];
+        cell.contentConfiguration = nil;
+        cell.textLabel.text = row[@"title"];
+        cell.textLabel.textAlignment = NSTextAlignmentNatural;
+        cell.textLabel.textColor = supported ? UIColor.labelColor : UIColor.tertiaryLabelColor;
     }
-
-    UIViewController *vc = [[UIViewController alloc] init];
-    vc.title = @"Log";
-    vc.view.backgroundColor = UIColor.systemGroupedBackgroundColor;
-
-    UITextView *tv = [[UITextView alloc] init];
-    tv.translatesAutoresizingMaskIntoConstraints = NO;
-    tv.editable = NO;
-    tv.font = [UIFont monospacedSystemFontOfSize:11.0 weight:UIFontWeightRegular];
-    tv.textColor = UIColor.labelColor;
-    tv.backgroundColor = UIColor.systemGroupedBackgroundColor;
-    tv.text = text;
-    [vc.view addSubview:tv];
-    [NSLayoutConstraint activateConstraints:@[
-        [tv.topAnchor      constraintEqualToAnchor:vc.view.safeAreaLayoutGuide.topAnchor],
-        [tv.bottomAnchor   constraintEqualToAnchor:vc.view.safeAreaLayoutGuide.bottomAnchor],
-        [tv.leadingAnchor  constraintEqualToAnchor:vc.view.leadingAnchor constant:16.0],
-        [tv.trailingAnchor constraintEqualToAnchor:vc.view.trailingAnchor constant:-16.0],
-    ]];
-
-    [self.navigationController pushViewController:vc animated:YES];
-}
-
-static void cyanide_upload_log_if_enabled(void) {
-    if (![[NSUserDefaults standardUserDefaults] boolForKey:kSettingsLogUploadEnabled]) return;
-    NSString *path = log_most_recent_session_path();
-    if (!path) return;
-    NSString *rawLog = [NSString stringWithContentsOfFile:path encoding:NSUTF8StringEncoding error:nil];
-    if (!rawLog.length) return;
-
-    NSString *appVersion = [NSBundle mainBundle].infoDictionary[@"CFBundleShortVersionString"] ?: @"unknown";
-    NSString *iosVersion = [UIDevice currentDevice].systemVersion;
-
-    struct utsname sysInfo;
-    uname(&sysInfo);
-    NSString *machine = [NSString stringWithUTF8String:sysInfo.machine];
-
-    NSString *header = [NSString stringWithFormat:
-        @"=== Cyanide Diagnostic Log ===\n"
-        @"app_version : %@\n"
-        @"ios_version : %@\n"
-        @"device      : %@\n"
-        @"log_file    : %@\n"
-        @"==============================\n\n",
-        appVersion, iosVersion, machine, path.lastPathComponent];
-
-    NSDictionary *body = @{
-        @"log": [header stringByAppendingString:rawLog],
-        @"meta": @{
-            @"build":  [NSString stringWithFormat:@"cyanide-%@", appVersion],
-            @"source": @"cyanide",
-            @"ios":    iosVersion,
-            @"device": machine,
-        }
-    };
-    NSData *data = [NSJSONSerialization dataWithJSONObject:body options:0 error:nil];
-    if (!data) return;
-    NSURL *url = [NSURL URLWithString:@"https://brokenblade-weblogs.hackerboii.workers.dev/log"];
-    NSMutableURLRequest *req = [NSMutableURLRequest requestWithURL:url];
-    req.HTTPMethod = @"POST";
-    [req setValue:@"application/json" forHTTPHeaderField:@"Content-Type"];
-    req.HTTPBody = data;
-    printf("[LOG] uploading diagnostic log (%zu bytes) to R2...\n", (size_t)data.length);
-    [[[NSURLSession sharedSession] dataTaskWithRequest:req completionHandler:^(NSData *d, NSURLResponse *r, NSError *e) {
-        if (e) {
-            printf("[LOG] upload failed: %s\n", e.localizedDescription.UTF8String);
-        } else {
-            NSHTTPURLResponse *http = (NSHTTPURLResponse *)r;
-            printf("[LOG] upload ok: HTTP %ld\n", (long)http.statusCode);
-        }
-    }] resume];
-}
-
-- (void)openFeedbackEmail
-{
-    NSString *logPath = log_most_recent_session_path();
-    if (!logPath) {
-        UIAlertController *ac = [UIAlertController
-            alertControllerWithTitle:@"No Log Yet"
-                             message:@"Run a chain at least once to capture a log, then come back here to share it. Logs are also visible in Files app → On My iPhone → Cyanide."
-                      preferredStyle:UIAlertControllerStyleAlert];
-        [ac addAction:[UIAlertAction actionWithTitle:@"OK" style:UIAlertActionStyleDefault handler:nil]];
-        [self presentViewController:ac animated:YES completion:nil];
-        return;
-    }
-
-    NSURL *src = [NSURL fileURLWithPath:logPath];
-    NSString *stem = src.lastPathComponent.stringByDeletingPathExtension;
-    NSString *txtName = [stem stringByAppendingPathExtension:@"txt"];
-    NSURL *dst = [NSURL fileURLWithPath:[NSTemporaryDirectory() stringByAppendingPathComponent:txtName]];
-    [[NSFileManager defaultManager] removeItemAtURL:dst error:nil];
-    NSError *copyErr = nil;
-    if (![[NSFileManager defaultManager] copyItemAtURL:src toURL:dst error:&copyErr]) {
-        UIAlertController *ac = [UIAlertController
-            alertControllerWithTitle:@"Couldn't Stage Log"
-                             message:copyErr.localizedDescription ?: @"Failed to prepare the log for sharing."
-                      preferredStyle:UIAlertControllerStyleAlert];
-        [ac addAction:[UIAlertAction actionWithTitle:@"OK" style:UIAlertActionStyleDefault handler:nil]];
-        [self presentViewController:ac animated:YES completion:nil];
-        return;
-    }
-
-    NSString *logText = [NSString stringWithContentsOfURL:dst encoding:NSUTF8StringEncoding error:nil]
-                        ?: @"(empty log)";
-    UIActivityViewController *vc = [[UIActivityViewController alloc] initWithActivityItems:@[logText]
-                                                                     applicationActivities:nil];
-    if (vc.popoverPresentationController) {
-        vc.popoverPresentationController.sourceView = self.view;
-        vc.popoverPresentationController.sourceRect = CGRectMake(self.view.bounds.size.width / 2.0,
-                                                                 self.view.bounds.size.height / 2.0,
-                                                                 0, 0);
-        vc.popoverPresentationController.permittedArrowDirections = 0;
-    }
-    [self presentViewController:vc animated:YES completion:nil];
-}
-
-static void downgrade_trigger_in_springboard(NSString *trackIdStr, NSString *versionIdStr) {
-    dispatch_async(dispatch_get_global_queue(0, 0), ^{
-        log_session_begin();
-        long long trackId = [trackIdStr longLongValue];
-        long long versionId = [versionIdStr longLongValue];
-        log_user("[DOWNGRADE] Requesting downgrade (Track: %lld, Version: %lld)...\n", trackId, versionId);
-        if (!settings_ensure_kexploit()) {
-            log_user("[DOWNGRADE] Failed: kernel primitives not acquired.\n");
-            log_session_end();
-            return;
-        }
-        @synchronized (settings_rc_lock()) {
-            if (!settings_ensure_springboard_remote_call_locked()) {
-                log_user("[DOWNGRADE] Failed to attach to SpringBoard.\n");
-                log_session_end();
-                return;
-            }
-            int sbx = escape_sbx_demo2_in_session();
-            if (sbx == 0) {
-                log_user("[DOWNGRADE] Sandbox extension consumed by SpringBoard.\n");
-            } else {
-                log_user("[WARN] Sandbox escape failed or already active (%d).\n", sbx);
-            }
-            log_user("[DOWNGRADE] Loading StoreKitUI framework into SpringBoard...\n");
-            uint64_t frameworkPathPtr = downgrade_remote_alloc_str("/System/Library/PrivateFrameworks/StoreKitUI.framework/StoreKitUI");
-            if (!frameworkPathPtr) {
-                log_user("[DOWNGRADE] ERROR: Failed to allocate memory in SpringBoard.\n");
-                log_session_end();
-                return;
-            }
-            uint64_t handle = do_remote_call_stable(1000, "dlopen", frameworkPathPtr, 9, 0, 0, 0, 0, 0, 0);
-            do_remote_call_stable(1000, "free", frameworkPathPtr, 0, 0, 0, 0, 0, 0, 0);
-            if (!handle) {
-                log_user("[DOWNGRADE] ERROR: SpringBoard failed to dlopen StoreKitUI.\n");
-                log_session_end();
-                return;
-            }
-            log_user("[DOWNGRADE] Constructing SKUI objects...\n");
-            NSString *adamIdStr = [NSString stringWithFormat:@"%lld", trackId];
-            NSString *buyParamsStr = [NSString stringWithFormat:@"productType=C&price=0&salableAdamId=%lld&pricingParameters=pricingParameter&appExtVrsId=%lld&clientBuyId=1&installed=0&trolled=1", trackId, versionId];
-            uint64_t adamIdCStrPtr = downgrade_remote_alloc_str(adamIdStr.UTF8String);
-            uint64_t paramsCStrPtr = downgrade_remote_alloc_str(buyParamsStr.UTF8String);
-            uint64_t kindCStrPtr = downgrade_remote_alloc_str("iosSoftware");
-            uint64_t buyParamsKeyCStrPtr = downgrade_remote_alloc_str("buyParams");
-            uint64_t itemOfferKeyCStrPtr = downgrade_remote_alloc_str("_itemOffer");
-            uint64_t kindKeyCStrPtr = downgrade_remote_alloc_str("_itemKindString");
-            uint64_t verKeyCStrPtr = downgrade_remote_alloc_str("_versionIdentifier");
-            uint64_t nsstringClass = remote_objc_getClass("NSString");
-            uint64_t stringWithUTF8StringSel = remote_sel_registerName("stringWithUTF8String:");
-            uint64_t adamIdNS = do_remote_call_stable(1000, "objc_msgSend", nsstringClass, stringWithUTF8StringSel, adamIdCStrPtr, 0, 0, 0, 0, 0);
-            uint64_t paramsNS = do_remote_call_stable(1000, "objc_msgSend", nsstringClass, stringWithUTF8StringSel, paramsCStrPtr, 0, 0, 0, 0, 0);
-            uint64_t kindNS = do_remote_call_stable(1000, "objc_msgSend", nsstringClass, stringWithUTF8StringSel, kindCStrPtr, 0, 0, 0, 0, 0);
-            uint64_t buyParamsKeyNS = do_remote_call_stable(1000, "objc_msgSend", nsstringClass, stringWithUTF8StringSel, buyParamsKeyCStrPtr, 0, 0, 0, 0, 0);
-            uint64_t itemOfferKeyNS = do_remote_call_stable(1000, "objc_msgSend", nsstringClass, stringWithUTF8StringSel, itemOfferKeyCStrPtr, 0, 0, 0, 0, 0);
-            uint64_t kindKeyNS = do_remote_call_stable(1000, "objc_msgSend", nsstringClass, stringWithUTF8StringSel, kindKeyCStrPtr, 0, 0, 0, 0, 0);
-            uint64_t verKeyNS = do_remote_call_stable(1000, "objc_msgSend", nsstringClass, stringWithUTF8StringSel, verKeyCStrPtr, 0, 0, 0, 0, 0);
-            uint64_t nsnumberClass = remote_objc_getClass("NSNumber");
-            uint64_t numberWithLongLongSel = remote_sel_registerName("numberWithLongLong:");
-            uint64_t versionNSNum = do_remote_call_stable(1000, "objc_msgSend", nsnumberClass, numberWithLongLongSel, versionId, 0, 0, 0, 0, 0);
-            uint64_t nsdictClass = remote_objc_getClass("NSDictionary");
-            uint64_t dictWithObjectForKeySel = remote_sel_registerName("dictionaryWithObject:forKey:");
-            uint64_t offerDict = do_remote_call_stable(1000, "objc_msgSend", nsdictClass, dictWithObjectForKeySel, paramsNS, buyParamsKeyNS, 0, 0, 0, 0);
-            uint64_t itemDict = do_remote_call_stable(1000, "objc_msgSend", nsdictClass, dictWithObjectForKeySel, adamIdNS, itemOfferKeyNS, 0, 0, 0, 0);
-            uint64_t allocSel = remote_sel_registerName("alloc");
-            uint64_t initDictSel = remote_sel_registerName("initWithLookupDictionary:");
-            uint64_t offerClass = remote_objc_getClass("SKUIItemOffer");
-            uint64_t offerAlloc = do_remote_call_stable(1000, "objc_msgSend", offerClass, allocSel, 0, 0, 0, 0, 0, 0);
-            uint64_t offerObj = do_remote_call_stable(1000, "objc_msgSend", offerAlloc, initDictSel, offerDict, 0, 0, 0, 0, 0);
-            uint64_t itemClass = remote_objc_getClass("SKUIItem");
-            uint64_t itemAlloc = do_remote_call_stable(1000, "objc_msgSend", itemClass, allocSel, 0, 0, 0, 0, 0, 0);
-            uint64_t itemObj = do_remote_call_stable(1000, "objc_msgSend", itemAlloc, initDictSel, itemDict, 0, 0, 0, 0, 0);
-            if (!offerObj || !itemObj) {
-                log_user("[DOWNGRADE] ERROR: Failed to instantiate SKUI items.\n");
-                log_session_end();
-                return;
-            }
-            uint64_t setValueForKeySel = remote_sel_registerName("setValue:forKey:");
-            do_remote_call_stable(1000, "objc_msgSend", itemObj, setValueForKeySel, offerObj, itemOfferKeyNS, 0, 0, 0, 0);
-            do_remote_call_stable(1000, "objc_msgSend", itemObj, setValueForKeySel, kindNS, kindKeyNS, 0, 0, 0, 0);
-            do_remote_call_stable(1000, "objc_msgSend", itemObj, setValueForKeySel, versionNSNum, verKeyNS, 0, 0, 0, 0);
-            uint64_t contextClass = remote_objc_getClass("SKUIClientContext");
-            uint64_t defContextSel = remote_sel_registerName("defaultContext");
-            uint64_t contextObj = do_remote_call_stable(1000, "objc_msgSend", contextClass, defContextSel, 0, 0, 0, 0, 0, 0);
-            uint64_t centerClass = remote_objc_getClass("SKUIItemStateCenter");
-            uint64_t defCenterSel = remote_sel_registerName("defaultCenter");
-            uint64_t centerObj = do_remote_call_stable(1000, "objc_msgSend", centerClass, defCenterSel, 0, 0, 0, 0, 0, 0);
-            uint64_t nsarrayClass = remote_objc_getClass("NSArray");
-            uint64_t arrayWithObjectSel = remote_sel_registerName("arrayWithObject:");
-            uint64_t itemsArray = do_remote_call_stable(1000, "objc_msgSend", nsarrayClass, arrayWithObjectSel, itemObj, 0, 0, 0, 0, 0);
-            uint64_t newPurchasesSel = remote_sel_registerName("_newPurchasesWithItems:");
-            uint64_t purchasesObj = do_remote_call_stable(1000, "objc_msgSend", centerObj, newPurchasesSel, itemsArray, 0, 0, 0, 0, 0);
-            log_user("[DOWNGRADE] Sending purchase request to App Store daemon...\n");
-            uint64_t performPurchasesSel = remote_sel_registerName("_performPurchases:hasBundlePurchase:withClientContext:completionBlock:");
-            do_remote_call_stable(1000, "objc_msgSend", centerObj, performPurchasesSel, purchasesObj, 0, contextObj, 0, 0, 0);
-            do_remote_call_stable(1000, "free", adamIdCStrPtr, 0, 0, 0, 0, 0, 0, 0);
-            do_remote_call_stable(1000, "free", paramsCStrPtr, 0, 0, 0, 0, 0, 0, 0);
-            do_remote_call_stable(1000, "free", kindCStrPtr, 0, 0, 0, 0, 0, 0, 0);
-            do_remote_call_stable(1000, "free", buyParamsKeyCStrPtr, 0, 0, 0, 0, 0, 0, 0);
-            do_remote_call_stable(1000, "free", itemOfferKeyCStrPtr, 0, 0, 0, 0, 0, 0, 0);
-            do_remote_call_stable(1000, "free", kindKeyCStrPtr, 0, 0, 0, 0, 0, 0, 0);
-            do_remote_call_stable(1000, "free", verKeyCStrPtr, 0, 0, 0, 0, 0, 0, 0);
-            log_user("[OK] Payload executed via RemoteCall! Please check your Home Screen for the downloading App.\n");
-        }
-        log_session_end();
-        dispatch_async(dispatch_get_main_queue(), ^{
-            [[NSNotificationCenter defaultCenter] postNotificationName:kSettingsActionsDidCompleteNotification object:nil];
-        });
-    });
-}
-
-@implementation AppListViewController
-- (void)viewDidLoad {
-    [super viewDidLoad];
-    self.title = @"Select App to Downgrade";
-    self.tableView.rowHeight = 60;
-    dispatch_async(dispatch_get_global_queue(0, 0), ^{
-        if (!g_springboard_sandbox_escaped) {
-            escape_sbx_demo2();
-        }
-        NSString *appsPath = @"/var/containers/Bundle/Application";
-        NSFileManager *fm = [NSFileManager defaultManager];
-        NSArray *appDirs = [fm contentsOfDirectoryAtPath:appsPath error:nil];
-        NSMutableArray *userApps = [NSMutableArray array];
-        for (NSString *uuidDir in appDirs) {
-            NSString *appGroupPath = [appsPath stringByAppendingPathComponent:uuidDir];
-            NSArray *subContents = [fm contentsOfDirectoryAtPath:appGroupPath error:nil];
-            for (NSString *sub in subContents) {
-                if ([sub hasSuffix:@".app"]) {
-                    NSString *appBundlePath = [appGroupPath stringByAppendingPathComponent:sub];
-                    NSString *infoPlistPath = [appBundlePath stringByAppendingPathComponent:@"Info.plist"];
-                    NSDictionary *info = [NSDictionary dictionaryWithContentsOfFile:infoPlistPath];
-                    if (info && info[@"CFBundleIdentifier"]) {
-                        [userApps addObject:info];
-                    }
-                }
-            }
-        }
-        [userApps sortUsingComparator:^NSComparisonResult(NSDictionary *obj1, NSDictionary *obj2) {
-            NSString *name1 = obj1[@"CFBundleDisplayName"] ?: obj1[@"CFBundleName"] ?: obj1[@"CFBundleIdentifier"];
-            NSString *name2 = obj2[@"CFBundleDisplayName"] ?: obj2[@"CFBundleName"] ?: obj2[@"CFBundleIdentifier"];
-            return [name1 localizedCaseInsensitiveCompare:name2];
-        }];
-        dispatch_async(dispatch_get_main_queue(), ^{
-            self.apps = userApps;
-            [self.tableView reloadData];
-        });
-    });
-}
-- (NSInteger)tableView:(UITableView *)tableView numberOfRowsInSection:(NSInteger)section {
-    return self.apps.count;
-}
-- (UITableViewCell *)tableView:(UITableView *)tableView cellForRowAtIndexPath:(NSIndexPath *)indexPath {
-    UITableViewCell *cell = [tableView dequeueReusableCellWithIdentifier:@"AppCell"];
-    if (!cell) cell = [[UITableViewCell alloc] initWithStyle:UITableViewCellStyleSubtitle reuseIdentifier:@"AppCell"];
-    NSDictionary *appInfo = self.apps[indexPath.row];
-    NSString *name = appInfo[@"CFBundleDisplayName"] ?: appInfo[@"CFBundleName"] ?: appInfo[@"CFBundleIdentifier"];
-    cell.textLabel.text = name;
-    cell.detailTextLabel.text = appInfo[@"CFBundleIdentifier"];
+    UISwitch *sw = [[UISwitch alloc] init];
+    sw.on = [d boolForKey:row[@"key"]];
+    sw.enabled = supported;
+    sw.tag = (indexPath.section << 16) | indexPath.row;
+    [sw addTarget:self action:@selector(toggleChanged:) forControlEvents:UIControlEventValueChanged];
+    cell.accessoryView = sw;
     return cell;
 }
-- (NSArray<NSString *> *)downgrade_supportedAppStoreCountryCodes {
-    return @[@"cn", @"us", @"ae", @"ag", @"ai", @"al", @"am", @"ao", @"ar", @"at", @"au", @"az", @"bb", @"be", @"bf", @"bg", @"bh", @"bj", @"bm", @"bn", @"bo", @"br", @"bs", @"bt", @"bw", @"by", @"bz", @"ca", @"cg", @"ch", @"ci", @"cl", @"cm", @"co", @"cr", @"cv", @"cy", @"cz", @"de", @"dk", @"dm", @"do", @"dz", @"ec", @"ee", @"eg", @"es", @"fi", @"fj", @"fm", @"fr", @"gb", @"gd", @"gh", @"gm", @"gr", @"gt", @"gw", @"gy", @"hk", @"hn", @"hr", @"hu", @"id", @"ie", @"il", @"in", @"is", @"it", @"jm", @"jo", @"jp", @"ke", @"kg", @"kh", @"kn", @"kr", @"kw", @"ky", @"kz", @"la", @"lb", @"lc", @"lk", @"lr", @"lt", @"lu", @"lv", @"md", @"mg", @"mk", @"ml", @"mn", @"mo", @"mr", @"ms", @"mt", @"mu", @"mw", @"mx", @"my", @"na", @"ne", @"ng", @"ni", @"nl", @"no", @"np", @"nz", @"om", @"pa", @"pe", @"pg", @"ph", @"pk", @"pl", @"pt", @"pw", @"py", @"qa", @"ro", @"ru", @"rw", @"sa", @"sb", @"sc", @"se", @"sg", @"si", @"sk", @"sl", @"sn", @"sr", @"st", @"sv", @"sz", @"tc", @"td", @"th", @"tj", @"tm", @"tn", @"tr", @"tt", @"tw", @"tz", @"ua", @"ug", @"uy", @"uz", @"vc", @"ve", @"vg", @"vn", @"ye", @"za", @"zm", @"zw"];
+
+#pragma mark - Actions
+
+- (NSDictionary *)rowForTag:(NSInteger)tag
+{
+    NSInteger section = (tag >> 16) & 0xFFFF;
+    NSInteger row = tag & 0xFFFF;
+    return [self rowsForSection:section][row];
 }
-- (void)downgrade_fetchTrackIDWithCountryCodes:(NSArray<NSString *> *)countryCodes index:(NSInteger)index bundleId:(NSString *)bundleId completion:(void(^)(long long trackId, NSError *err))completion {
-    if (index >= countryCodes.count) {
-        if (completion) {
-            completion(0, [NSError errorWithDomain:@"Downgrade" code:404 userInfo:@{NSLocalizedDescriptionKey: @"App not found in supported App Store regions."}]);
-        }
+
+- (void)presentApplyLogIfRunning
+{
+    if (self.presentedViewController) return;
+    if (!g_springboard_rc_ready) return;
+
+    InstallProgressViewController *vc = [[InstallProgressViewController alloc] init];
+    UINavigationController *nav = [[UINavigationController alloc] initWithRootViewController:vc];
+    nav.modalPresentationStyle = UIModalPresentationAutomatic;
+    [self presentViewController:nav animated:YES completion:nil];
+}
+
+- (void)toggleChanged:(UISwitch *)sender
+{
+    if (!settings_device_supported()) {
+        sender.on = !sender.isOn;
+        printf("[SETTINGS] toggle blocked: %s\n", settings_unsupported_message().UTF8String);
         return;
     }
-    NSString *countryCode = countryCodes[index];
-    NSString *urlString = [NSString stringWithFormat:@"https://itunes.apple.com/lookup?bundleId=%@&limit=1&media=software&country=%@", bundleId, countryCode];
-    NSURL *url = [NSURL URLWithString:urlString];
-    NSURLSessionDataTask *task = [[NSURLSession sharedSession] dataTaskWithRequest:[NSURLRequest requestWithURL:url] completionHandler:^(NSData *data, NSURLResponse *response, NSError *error) {
-        if (error || !data) {
-            dispatch_async(dispatch_get_main_queue(), ^{
-                [self downgrade_fetchTrackIDWithCountryCodes:countryCodes index:index + 1 bundleId:bundleId completion:completion];
-            });
-            return;
-        }
-        NSDictionary *json = [NSJSONSerialization JSONObjectWithData:data options:0 error:nil];
-        NSArray *results = json[@"results"];
-        if ([results isKindOfClass:[NSArray class]] && results.count > 0) {
-            long long trackId = [results.firstObject[@"trackId"] longLongValue];
-            dispatch_async(dispatch_get_main_queue(), ^{
-                if (completion) completion(trackId, nil);
-            });
-        } else {
-            dispatch_async(dispatch_get_main_queue(), ^{
-                [self downgrade_fetchTrackIDWithCountryCodes:countryCodes index:index + 1 bundleId:bundleId completion:completion];
-            });
-        }
-    }];
-    [task resume];
-}
-- (void)downgrade_fetchTrackIDForBundleID:(NSString *)bundleId completion:(void(^)(long long trackId, NSError *err))completion {
-    NSArray<NSString *> *countryCodes = [self downgrade_supportedAppStoreCountryCodes];
-    [self downgrade_fetchTrackIDWithCountryCodes:countryCodes index:0 bundleId:bundleId completion:completion];
-}
-- (void)downgrade_fetchVersionsForTrackID:(long long)trackId completion:(void(^)(NSArray *versions, NSError *err))completion {
-    NSURL *url = [NSURL URLWithString:[NSString stringWithFormat:@"https://apis.bilin.eu.org/history/%lld", trackId]];
-    NSURLSessionDataTask *task = [[NSURLSession sharedSession] dataTaskWithRequest:[NSURLRequest requestWithURL:url] completionHandler:^(NSData *data, NSURLResponse *response, NSError *error) {
-        dispatch_async(dispatch_get_main_queue(), ^{
-            if (error || !data) { if(completion) completion(nil, error); return; }
-            NSDictionary *json = [NSJSONSerialization JSONObjectWithData:data options:0 error:nil];
-            NSArray *versions = json[@"data"];
-            if ([versions isKindOfClass:[NSArray class]] && versions.count > 0) {
-                if (completion) completion(versions, nil);
-            } else {
-                if (completion) completion(nil, [NSError errorWithDomain:@"Downgrade" code:404 userInfo:@{NSLocalizedDescriptionKey: @"No historical versions found."}]);
-            }
-        });
-    }];
-    [task resume];
-}
-- (void)downgrade_presentVersionSelection:(NSArray *)versions trackID:(long long)trackId {
-    UIAlertController *alert = [UIAlertController alertControllerWithTitle:@"Select Version" message:@"Choose a version to downgrade to" preferredStyle:UIAlertControllerStyleActionSheet];
-    NSArray *sortedVersions = [versions sortedArrayUsingDescriptors:@[[NSSortDescriptor sortDescriptorWithKey:@"release_date" ascending:NO]]];
-    for (NSDictionary *ver in sortedVersions) {
-        NSString *bVer = ver[@"bundle_version"] ?: @"N/A";
-        NSString *extId = [ver[@"external_identifier"] stringValue] ?: @"";
-        NSString *title = extId.length > 0 ? [NSString stringWithFormat:@"%@ (%@)", bVer, extId] : bVer;
-        [alert addAction:[UIAlertAction actionWithTitle:title style:UIAlertActionStyleDefault handler:^(UIAlertAction * _Nonnull action) {
-            NSString *versionIdStr = [ver[@"external_identifier"] stringValue];
-            NSString *trackIdStr = [NSString stringWithFormat:@"%lld", trackId];
-            InstallProgressViewController *logVC = [[InstallProgressViewController alloc] init];
-            UINavigationController *logNav = [[UINavigationController alloc] initWithRootViewController:logVC];
-            logNav.modalPresentationStyle = UIModalPresentationAutomatic;
-            [self presentViewController:logNav animated:YES completion:^{
-                downgrade_trigger_in_springboard(trackIdStr, versionIdStr);
-            }];
-        }]];
+
+    NSDictionary *row = [self rowForTag:sender.tag];
+    NSString *key = row[@"key"];
+    [[NSUserDefaults standardUserDefaults] setBool:sender.isOn forKey:key];
+    printf("[SETTINGS] toggle %s=%d\n", key.UTF8String, sender.isOn);
+    if ([key isEqualToString:kSettingsKeepAlive]) {
+        ds_keepalive_apply_enabled(sender.isOn);
+        return;
     }
-    [alert addAction:[UIAlertAction actionWithTitle:@"Cancel" style:UIAlertActionStyleCancel handler:nil]];
-    if ([[UIDevice currentDevice] userInterfaceIdiom] == UIUserInterfaceIdiomPad && alert.popoverPresentationController) {
-        alert.popoverPresentationController.sourceView = self.view;
-        alert.popoverPresentationController.sourceRect = CGRectMake(self.view.bounds.size.width / 2.0, self.view.bounds.size.height / 2.0, 1.0, 1.0);
-        alert.popoverPresentationController.permittedArrowDirections = 0;
+    if (settings_key_affects_package_state(key)) {
+        if (!sender.isOn) settings_mark_tweak_applied(key, NO);
+        settings_notify_package_queue_changed_async();
     }
-    [self presentViewController:alert animated:YES completion:nil];
+    settings_schedule_live_apply_for_key(key);
+    [self presentApplyLogIfRunning];
 }
-- (void)tableView:(UITableView *)tableView didSelectRowAtIndexPath:(NSIndexPath *)indexPath {
-    [tableView deselectRowAtIndexPath:indexPath animated:YES];
-    NSDictionary *appInfo = self.apps[indexPath.row];
-    NSString *bundleId = appInfo[@"CFBundleIdentifier"];
-    UIAlertController *loadingAlert = [UIAlertController alertControllerWithTitle:@"Fetching Data..." message:@"Looking up App Store region and history..." preferredStyle:UIAlertControllerStyleAlert];
-    [self presentViewController:loadingAlert animated:YES completion:^{
-        [self downgrade_fetchTrackIDForBundleID:bundleId completion:^(long long trackId, NSError *err) {
-            if (err || trackId == 0) {
-                [loadingAlert dismissViewControllerAnimated:YES completion:^{
-                    UIAlertController *errAlert = [UIAlertController alertControllerWithTitle:@"Error" message:err.localizedDescription ?: @"Failed to get Track ID" preferredStyle:UIAlertControllerStyleAlert];
-                    [errAlert addAction:[UIAlertAction actionWithTitle:@"OK" style:UIAlertActionStyleCancel handler:nil]];
-                    [self presentViewController:errAlert animated:YES completion:nil];
-                }];
-                return;
-            }
-            [self downgrade_fetchVersionsForTrackID:trackId completion:^(NSArray *versions, NSError *verErr) {
-                [loadingAlert dismissViewControllerAnimated:YES completion:^{
-                    if (verErr || versions.count == 0) {
-                        UIAlertController *errAlert = [UIAlertController alertControllerWithTitle:@"Error" message:verErr.localizedDescription ?: @"Failed to get versions" preferredStyle:UIAlertControllerStyleAlert];
-                        [errAlert addAction:[UIAlertAction actionWithTitle:@"OK" style:UIAlertActionStyleCancel handler:nil]];
-                        [self presentViewController:errAlert animated:YES completion:nil];
-                        return;
-                    }
-                    [self downgrade_presentVersionSelection:versions trackID:trackId];
-                }];
-            }];
-        }];
-    }];
+
+- (void)stepperChanged:(UIStepper *)sender
+{
+    if (!settings_device_supported()) {
+        printf("[SETTINGS] stepper blocked: %s\n", settings_unsupported_message().UTF8String);
+        return;
+    }
+
+    NSDictionary *row = [self rowForTag:sender.tag];
+    NSInteger value = (NSInteger)sender.value;
+    [[NSUserDefaults standardUserDefaults] setInteger:value forKey:row[@"key"]];
+    settings_schedule_live_apply_for_key(row[@"key"]);
+    [self presentApplyLogIfRunning];
+
+    UIView *v = sender.superview;
+    while (v && ![v isKindOfClass:UITableViewCell.class]) v = v.superview;
+    UITableViewCell *cell = (UITableViewCell *)v;
+    if (cell) {
+        cell.textLabel.text = [NSString stringWithFormat:@"%@: %ld", row[@"title"], (long)value];
+    }
 }
-@end
+
+- (void)powercuffSegChanged:(UISegmentedControl *)sender
+{
+    if (!settings_device_supported()) {
+        printf("[SETTINGS] powercuff level blocked: %s\n", settings_unsupported_message().UTF8String);
+        return;
+    }
+
+    NSArray<NSString *> *levels = powercuff_levels();
+    if (sender.selectedSegmentIndex < 0 || sender.selectedSegmentIndex >= (NSInteger)levels.count) return;
+    [[NSUserDefaults standardUserDefaults] setObject:levels[sender.selectedSegmentIndex]
+                                              forKey:kSettingsPowercuffLevel];
+}
 
 - (void)tableView:(UITableView *)tableView didSelectRowAtIndexPath:(NSIndexPath *)indexPath
 {
