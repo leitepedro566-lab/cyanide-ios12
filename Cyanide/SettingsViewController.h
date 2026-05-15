@@ -62,4 +62,11 @@ void settings_application_did_become_active(void);
 - (instancetype)initWithCoder:(NSCoder *)coder;
 - (instancetype)initWithNibName:(nullable NSString *)nibNameOrNil bundle:(nullable NSBundle *)nibBundleOrNil NS_UNAVAILABLE;
 
+// When set on a bundle-detail SettingsViewController launched from the
+// Installer's "Customize" row, the nav bar shows a left-side back button
+// ("← <package name>") that pops Settings to root and switches the user
+// back to the Installer tab — so the install action stays one tap away
+// after customizing.
+@property (nonatomic, copy, nullable) NSString *installerReturnPackageName;
+
 @end

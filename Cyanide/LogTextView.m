@@ -10,6 +10,8 @@
 #include <stdarg.h>
 #include <stdio.h>
 #include <string.h>
+#include <sys/time.h>
+#include <time.h>
 
 #define LOG_MAX_LINES   50000
 #define LOG_TRIM_TO     30000
@@ -21,6 +23,12 @@ static int             log_dirty    = 0;
 static int             log_trim_gen = 0;  // increments each time the buffer is trimmed
 static int             log_verbose  = 1;
 static pthread_mutex_t log_mutex    = PTHREAD_MUTEX_INITIALIZER;
+
+// Session-log persistence. log_file is non-NULL while a chain run is active;
+// every completed line is also written here with a wall-clock timestamp.
+// Both fields are guarded by log_mutex.
+static FILE *log_file                = NULL;
+static char  log_file_path_c[1024]   = {0};
 
 void log_init(void) {
     pthread_mutex_lock(&log_mutex);
@@ -47,6 +55,19 @@ static void log_write_raw(const char *msg) {
             strlcpy(log_buf[log_count], line_buf, LOG_LINE_SIZE);
             log_count++;
             log_dirty = 1;
+
+            if (log_file) {
+                struct timeval tv;
+                gettimeofday(&tv, NULL);
+                struct tm tm;
+                localtime_r(&tv.tv_sec, &tm);
+                int ms = (int)(tv.tv_usec / 1000);
+                fprintf(log_file, "[%02d:%02d:%02d.%03d] %s\n",
+                        tm.tm_hour, tm.tm_min, tm.tm_sec, ms,
+                        line_buf);
+                fflush(log_file);
+            }
+
             line_pos  = 0;
         } else {
             if (line_pos < LOG_LINE_SIZE - 1)
@@ -86,6 +107,127 @@ void log_user(const char *fmt, ...) {
     vsnprintf(buf, sizeof(buf), fmt, ap);
     va_end(ap);
     log_write_raw(buf);
+}
+
+// ---------------------------------------------------------------------------
+// Session log persistence
+//
+// log_session_begin opens a timestamped file under <Documents>/logs/. While it
+// is open, log_write_raw (above) tees each completed line into it with an
+// [HH:MM:SS.mmm] prefix. log_session_end flushes + closes.
+// A capped retention policy keeps the newest N session logs and prunes older
+// ones each time a session begins, so the directory doesn't grow unbounded.
+
+#define LOG_SESSIONS_KEEP 20
+
+static NSURL *log_session_dir_url(void) {
+    // Logs land at the root of the app's Documents, which Info.plist's
+    // UIFileSharingEnabled exposes to Files.app under
+    // On My iPhone → Cyanide → chain-*.log.
+    NSURL *docs = [[[NSFileManager defaultManager]
+                    URLsForDirectory:NSDocumentDirectory
+                           inDomains:NSUserDomainMask] firstObject];
+    return docs;
+}
+
+static void log_prune_old_sessions(NSInteger keep) {
+    @autoreleasepool {
+        NSURL *dir = log_session_dir_url();
+        if (!dir) return;
+        NSArray<NSURL *> *files = [[NSFileManager defaultManager]
+            contentsOfDirectoryAtURL:dir
+            includingPropertiesForKeys:@[NSURLContentModificationDateKey]
+                             options:0
+                               error:nil];
+        if (!files) return;
+        NSPredicate *isLog = [NSPredicate predicateWithFormat:@"pathExtension = 'log'"];
+        NSArray<NSURL *> *logs = [files filteredArrayUsingPredicate:isLog];
+        if (logs.count <= (NSUInteger)keep) return;
+        NSArray<NSURL *> *sorted = [logs sortedArrayUsingComparator:^NSComparisonResult(NSURL *a, NSURL *b) {
+            NSDate *da = nil, *db = nil;
+            [a getResourceValue:&da forKey:NSURLContentModificationDateKey error:nil];
+            [b getResourceValue:&db forKey:NSURLContentModificationDateKey error:nil];
+            return [db compare:da]; // newest first
+        }];
+        for (NSUInteger i = (NSUInteger)keep; i < sorted.count; i++) {
+            [[NSFileManager defaultManager] removeItemAtURL:sorted[i] error:nil];
+        }
+    }
+}
+
+void log_session_begin(void) {
+    NSURL *fileURL = nil;
+    @autoreleasepool {
+        NSURL *dir = log_session_dir_url();
+        if (!dir) return;
+        [[NSFileManager defaultManager] createDirectoryAtURL:dir
+                                 withIntermediateDirectories:YES
+                                                  attributes:nil
+                                                       error:nil];
+
+        NSDateFormatter *df = [[NSDateFormatter alloc] init];
+        df.dateFormat = @"yyyyMMdd-HHmmss";
+        df.locale = [NSLocale localeWithLocaleIdentifier:@"en_US_POSIX"];
+        df.timeZone = [NSTimeZone localTimeZone];
+        NSString *name = [NSString stringWithFormat:@"chain-%@.log",
+                          [df stringFromDate:[NSDate date]]];
+        fileURL = [dir URLByAppendingPathComponent:name];
+    }
+    if (!fileURL) return;
+
+    pthread_mutex_lock(&log_mutex);
+    if (log_file) {
+        fclose(log_file);
+        log_file = NULL;
+    }
+    strlcpy(log_file_path_c, fileURL.path.fileSystemRepresentation, sizeof(log_file_path_c));
+    log_file = fopen(log_file_path_c, "w");
+    if (log_file) {
+        time_t t = time(NULL);
+        struct tm tm; localtime_r(&t, &tm);
+        fprintf(log_file,
+                "# Cyanide chain session %04d-%02d-%02d %02d:%02d:%02d\n",
+                tm.tm_year + 1900, tm.tm_mon + 1, tm.tm_mday,
+                tm.tm_hour, tm.tm_min, tm.tm_sec);
+        fflush(log_file);
+    }
+    pthread_mutex_unlock(&log_mutex);
+
+    log_prune_old_sessions(LOG_SESSIONS_KEEP);
+}
+
+void log_session_end(void) {
+    pthread_mutex_lock(&log_mutex);
+    if (log_file) {
+        fflush(log_file);
+        fclose(log_file);
+        log_file = NULL;
+        log_file_path_c[0] = '\0';
+    }
+    pthread_mutex_unlock(&log_mutex);
+}
+
+NSString *log_most_recent_session_path(void) {
+    @autoreleasepool {
+        NSURL *dir = log_session_dir_url();
+        if (!dir) return nil;
+        NSArray<NSURL *> *files = [[NSFileManager defaultManager]
+            contentsOfDirectoryAtURL:dir
+            includingPropertiesForKeys:@[NSURLContentModificationDateKey]
+                             options:0
+                               error:nil];
+        if (!files) return nil;
+        NSPredicate *isLog = [NSPredicate predicateWithFormat:@"pathExtension = 'log'"];
+        NSArray<NSURL *> *logs = [files filteredArrayUsingPredicate:isLog];
+        if (logs.count == 0) return nil;
+        NSArray<NSURL *> *sorted = [logs sortedArrayUsingComparator:^NSComparisonResult(NSURL *a, NSURL *b) {
+            NSDate *da = nil, *db = nil;
+            [a getResourceValue:&da forKey:NSURLContentModificationDateKey error:nil];
+            [b getResourceValue:&db forKey:NSURLContentModificationDateKey error:nil];
+            return [db compare:da];
+        }];
+        return sorted.firstObject.path;
+    }
 }
 
 // Returns only lines [fromLine, log_count). Outputs current total and trim
@@ -179,7 +321,7 @@ static UIColor *colorForLogLine(NSString *line) {
 - (void)setup {
     self.editable   = NO;
     self.font       = [UIFont monospacedSystemFontOfSize:13 weight:UIFontWeightRegular];
-    self.backgroundColor = [UIColor colorWithRed:0.08 green:0.09 blue:0.16 alpha:1.0];
+    self.backgroundColor = [UIColor colorWithRed:0.02 green:0.05 blue:0.06 alpha:1.0];
     self.textColor  = UIColor.whiteColor;
     self.textContainerInset = UIEdgeInsetsMake(12, 10, 12, 10);
     self.contentInsetAdjustmentBehavior = UIScrollViewContentInsetAdjustmentAlways;

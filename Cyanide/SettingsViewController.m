@@ -1557,6 +1557,7 @@ void settings_run_actions(void)
             log_user("[RUN] Already running. Let the current operation finish.\n");
             return;
         }
+        log_session_begin();
         @try {
             BOOL patchSandboxExt = [d boolForKey:kSettingsRunPatchSandboxExt];
             BOOL runPowercuff = [d boolForKey:kSettingsPowercuffEnabled];
@@ -1769,6 +1770,7 @@ void settings_run_actions(void)
 
             log_user("[DONE] Run complete. Verbose trace captured the raw call stream.\n");
         } @finally {
+            log_session_end();
             __sync_lock_release(&g_settings_actions_running);
             settings_reconcile_applied_from_defaults();
             dispatch_async(dispatch_get_main_queue(), ^{
@@ -1798,6 +1800,7 @@ typedef NS_ENUM(NSInteger, RootSection) {
     RootSectionActions,
     RootSectionTweakBundles,
     RootSectionSystemBundles,
+    RootSectionAbout,
     RootSectionCount,
 };
 
@@ -1852,10 +1855,49 @@ typedef NS_ENUM(NSInteger, RootSection) {
     [self.tableView registerClass:UITableViewCell.class forCellReuseIdentifier:@"button"];
     [self.tableView registerClass:UITableViewCell.class forCellReuseIdentifier:@"warning"];
     [self.tableView registerClass:UITableViewCell.class forCellReuseIdentifier:@"bundle"];
+    [self installInstallerReturnButtonIfNeeded];
     [[NSNotificationCenter defaultCenter] addObserver:self
                                              selector:@selector(remoteCallStateDidChange:)
                                                  name:kSettingsRemoteCallStateDidChangeNotification
                                                object:nil];
+}
+
+- (void)installInstallerReturnButtonIfNeeded
+{
+    if (!self.installerReturnPackageName) return;
+
+    UIButton *btn = [UIButton buttonWithType:UIButtonTypeSystem];
+    UIImageSymbolConfiguration *cfg = [UIImageSymbolConfiguration configurationWithPointSize:17.0 weight:UIImageSymbolWeightSemibold];
+    UIImage *chevron = [UIImage systemImageNamed:@"chevron.backward" withConfiguration:cfg];
+    [btn setImage:chevron forState:UIControlStateNormal];
+    [btn setTitle:[@" " stringByAppendingString:self.installerReturnPackageName] forState:UIControlStateNormal];
+    btn.titleLabel.font = [UIFont systemFontOfSize:17.0 weight:UIFontWeightRegular];
+    btn.tintColor = self.view.tintColor;
+    btn.contentEdgeInsets = UIEdgeInsetsMake(0, 0, 0, 4);
+    [btn addTarget:self action:@selector(returnToInstaller) forControlEvents:UIControlEventTouchUpInside];
+    [btn sizeToFit];
+
+    UIBarButtonItem *backItem = [[UIBarButtonItem alloc] initWithCustomView:btn];
+    self.navigationItem.leftBarButtonItem = backItem;
+    self.navigationItem.hidesBackButton = YES;
+}
+
+- (void)returnToInstaller
+{
+    UITabBarController *tab = self.tabBarController;
+    UINavigationController *settingsNav = self.navigationController;
+    NSUInteger installerIdx = NSNotFound;
+    for (NSUInteger i = 0; i < tab.viewControllers.count; i++) {
+        UIViewController *vc = tab.viewControllers[i];
+        if ([vc.tabBarItem.title isEqualToString:@"Installer"]) {
+            installerIdx = i;
+            break;
+        }
+    }
+    [settingsNav popToRootViewControllerAnimated:NO];
+    if (installerIdx != NSNotFound) {
+        tab.selectedIndex = installerIdx;
+    }
 }
 
 - (void)dealloc
@@ -2082,6 +2124,7 @@ typedef NS_ENUM(NSInteger, RootSection) {
         case RootSectionActions:        return 3;
         case RootSectionTweakBundles:   return (NSInteger)self.tweakBundleRows.count;
         case RootSectionSystemBundles:  return (NSInteger)self.systemBundleRows.count;
+        case RootSectionAbout:          return 2;
         case RootSectionCount:          return 0;
     }
     return 0;
@@ -2094,6 +2137,7 @@ typedef NS_ENUM(NSInteger, RootSection) {
         case RootSectionActions:        return @"Quick Actions";
         case RootSectionTweakBundles:   return self.tweakBundleRows.count   > 0 ? @"Tweaks" : nil;
         case RootSectionSystemBundles:  return self.systemBundleRows.count  > 0 ? @"System" : nil;
+        case RootSectionAbout:          return @"About";
         default:                        return nil;
     }
 }
@@ -2187,6 +2231,80 @@ typedef NS_ENUM(NSInteger, RootSection) {
     return cell;
 }
 
+- (UITableViewCell *)buildAboutCellAtRow:(NSInteger)row tableView:(UITableView *)tableView
+{
+    UITableViewCell *cell = [tableView dequeueReusableCellWithIdentifier:@"about"];
+    if (!cell) {
+        cell = [[UITableViewCell alloc] initWithStyle:UITableViewCellStyleValue1 reuseIdentifier:@"about"];
+    }
+    cell.accessoryType = UITableViewCellAccessoryDisclosureIndicator;
+    cell.selectionStyle = UITableViewCellSelectionStyleDefault;
+    cell.textLabel.font = [UIFont systemFontOfSize:17.0];
+    cell.textLabel.textColor = UIColor.labelColor;
+    cell.detailTextLabel.textColor = UIColor.secondaryLabelColor;
+    cell.detailTextLabel.text = nil;
+
+    if (row == 0) {
+        cell.imageView.image = [SettingsViewController iconBadgeWithSymbol:@"at" color:UIColor.systemBlueColor size:29.0];
+        cell.textLabel.text = @"Twitter";
+        cell.detailTextLabel.text = @"@zeroxjf";
+    } else {
+        cell.imageView.image = [SettingsViewController iconBadgeWithSymbol:@"square.and.arrow.up" color:UIColor.systemGreenColor size:29.0];
+        cell.textLabel.text = @"Submit Feedback";
+    }
+    return cell;
+}
+
+- (void)openTwitter
+{
+    NSURL *url = [NSURL URLWithString:@"https://twitter.com/zeroxjf"];
+    if (url) [[UIApplication sharedApplication] openURL:url options:@{} completionHandler:nil];
+}
+
+- (void)openFeedbackEmail
+{
+    NSString *logPath = log_most_recent_session_path();
+    if (!logPath) {
+        UIAlertController *ac = [UIAlertController
+            alertControllerWithTitle:@"No Log Yet"
+                             message:@"Run a chain at least once to capture a log, then come back here to share it. Logs are also visible in Files app → On My iPhone → Cyanide."
+                      preferredStyle:UIAlertControllerStyleAlert];
+        [ac addAction:[UIAlertAction actionWithTitle:@"OK" style:UIAlertActionStyleDefault handler:nil]];
+        [self presentViewController:ac animated:YES completion:nil];
+        return;
+    }
+
+    // Stage the log under NSTemporaryDirectory with a .txt extension so the
+    // share sheet treats it as plain text in every target app.
+    NSURL *src = [NSURL fileURLWithPath:logPath];
+    NSString *stem = src.lastPathComponent.stringByDeletingPathExtension;
+    NSString *txtName = [stem stringByAppendingPathExtension:@"txt"];
+    NSURL *dst = [NSURL fileURLWithPath:[NSTemporaryDirectory() stringByAppendingPathComponent:txtName]];
+    [[NSFileManager defaultManager] removeItemAtURL:dst error:nil];
+    NSError *copyErr = nil;
+    if (![[NSFileManager defaultManager] copyItemAtURL:src toURL:dst error:&copyErr]) {
+        UIAlertController *ac = [UIAlertController
+            alertControllerWithTitle:@"Couldn't Stage Log"
+                             message:copyErr.localizedDescription ?: @"Failed to prepare the log for sharing."
+                      preferredStyle:UIAlertControllerStyleAlert];
+        [ac addAction:[UIAlertAction actionWithTitle:@"OK" style:UIAlertActionStyleDefault handler:nil]];
+        [self presentViewController:ac animated:YES completion:nil];
+        return;
+    }
+
+    UIActivityViewController *vc = [[UIActivityViewController alloc] initWithActivityItems:@[dst]
+                                                                     applicationActivities:nil];
+    // iPad needs a popover anchor; iPhone ignores these properties.
+    if (vc.popoverPresentationController) {
+        vc.popoverPresentationController.sourceView = self.view;
+        vc.popoverPresentationController.sourceRect = CGRectMake(self.view.bounds.size.width / 2.0,
+                                                                  self.view.bounds.size.height / 2.0,
+                                                                  0, 0);
+        vc.popoverPresentationController.permittedArrowDirections = 0;
+    }
+    [self presentViewController:vc animated:YES completion:nil];
+}
+
 - (UITableViewCell *)tableView:(UITableView *)tableView cellForRowAtIndexPath:(NSIndexPath *)indexPath
 {
     // Preserve the table view's actual indexPath for dequeue calls (which
@@ -2205,6 +2323,8 @@ typedef NS_ENUM(NSInteger, RootSection) {
                 return [self buildBundleCellWithRow:self.tweakBundleRows[indexPath.row] tableView:tableView];
             case RootSectionSystemBundles:
                 return [self buildBundleCellWithRow:self.systemBundleRows[indexPath.row] tableView:tableView];
+            case RootSectionAbout:
+                return [self buildAboutCellAtRow:indexPath.row tableView:tableView];
             case RootSectionCount:
                 return [[UITableViewCell alloc] init];
         }
@@ -2486,6 +2606,10 @@ typedef NS_ENUM(NSInteger, RootSection) {
                 [self.navigationController pushViewController:detail animated:YES];
                 return;
             }
+            case RootSectionAbout:
+                if (indexPath.row == 0) [self openTwitter];
+                else                    [self openFeedbackEmail];
+                return;
             case RootSectionCount:
                 return;
         }

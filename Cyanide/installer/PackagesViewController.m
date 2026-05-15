@@ -9,11 +9,17 @@
 #import "PackageQueue.h"
 #import "../SettingsViewController.h"
 
-static NSString * const kPackageCellID = @"PackageCell";
+static NSString * const kPackageCellID         = @"PackageCell";
+static NSString * const kGroupByCategoryDefault = @"installer.groupByCategory";
 
-@interface PackagesViewController ()
-@property (nonatomic, copy) NSArray<NSString *> *categories;
-@property (nonatomic, copy) NSDictionary<NSString *, NSArray<Package *> *> *packagesByCategory;
+@interface PackagesViewController () <UISearchResultsUpdating>
+@property (nonatomic, copy)   NSArray<Package *> *allPackagesSorted;
+@property (nonatomic, copy)   NSArray<Package *> *flatPackages;        // shown when !groupByCategory
+@property (nonatomic, copy)   NSArray<NSString *> *visibleCategories;  // shown when groupByCategory
+@property (nonatomic, copy)   NSDictionary<NSString *, NSArray<Package *> *> *packagesByCategory;
+@property (nonatomic, copy)   NSString *searchText;
+@property (nonatomic, assign) BOOL groupByCategory;
+@property (nonatomic, strong) UISearchController *searchCtl;
 @end
 
 @implementation PackagesViewController
@@ -24,11 +30,34 @@ static NSString * const kPackageCellID = @"PackageCell";
     self.title = @"Installer";
     self.navigationItem.title = @"Installer";
 
-    self.categories = [PackageCatalog categoriesInOrder];
-    self.packagesByCategory = [PackageCatalog packagesByCategory];
+    self.groupByCategory = [[NSUserDefaults standardUserDefaults] boolForKey:kGroupByCategoryDefault];
+    self.searchText = @"";
+
+    self.allPackagesSorted = [[PackageCatalog allPackages]
+        sortedArrayUsingComparator:^NSComparisonResult(Package *a, Package *b) {
+            return [a.name caseInsensitiveCompare:b.name];
+        }];
 
     self.tableView.rowHeight = UITableViewAutomaticDimension;
-    self.tableView.estimatedRowHeight = 64.0;
+    self.tableView.estimatedRowHeight = 76.0;
+    // Tighten the gap between the search bar / nav bar and the first row.
+    // iOS 15+ inset-grouped tables add ~22pt of "section header top padding"
+    // above section 0 by default; collapse it so the package block sits
+    // right under the search field.
+    if (@available(iOS 15.0, *)) {
+        self.tableView.sectionHeaderTopPadding = 0.0;
+    }
+
+    // Search controller pinned in the nav bar so it shows above the table.
+    self.searchCtl = [[UISearchController alloc] initWithSearchResultsController:nil];
+    self.searchCtl.searchResultsUpdater = self;
+    self.searchCtl.obscuresBackgroundDuringPresentation = NO;
+    self.searchCtl.searchBar.placeholder = @"Search tweaks";
+    self.navigationItem.searchController = self.searchCtl;
+    self.navigationItem.hidesSearchBarWhenScrolling = NO;
+
+    [self installSortBarButton];
+    [self rebuildFilteredData];
 
     [[NSNotificationCenter defaultCenter] addObserver:self
                                              selector:@selector(queueDidChange:)
@@ -48,6 +77,7 @@ static NSString * const kPackageCellID = @"PackageCell";
 - (void)viewWillAppear:(BOOL)animated
 {
     [super viewWillAppear:animated];
+    [self rebuildFilteredData];
     [self.tableView reloadData];
 }
 
@@ -57,35 +87,126 @@ static NSString * const kPackageCellID = @"PackageCell";
     [self.tableView reloadData];
 }
 
+#pragma mark - Sort menu
+
+- (void)installSortBarButton
+{
+    UIAction *flat = [UIAction actionWithTitle:@"Alphabetical"
+                                         image:[UIImage systemImageNamed:@"list.bullet"]
+                                    identifier:nil
+                                       handler:^(UIAction *_) {
+        [self applyGroupByCategory:NO];
+    }];
+    flat.state = self.groupByCategory ? UIMenuElementStateOff : UIMenuElementStateOn;
+
+    UIAction *byCat = [UIAction actionWithTitle:@"By Category"
+                                          image:[UIImage systemImageNamed:@"folder"]
+                                     identifier:nil
+                                        handler:^(UIAction *_) {
+        [self applyGroupByCategory:YES];
+    }];
+    byCat.state = self.groupByCategory ? UIMenuElementStateOn : UIMenuElementStateOff;
+
+    UIMenu *menu = [UIMenu menuWithTitle:@"Sort" children:@[flat, byCat]];
+    UIBarButtonItem *btn = [[UIBarButtonItem alloc]
+        initWithImage:[UIImage systemImageNamed:@"line.3.horizontal.decrease.circle"]
+                 menu:menu];
+    self.navigationItem.rightBarButtonItem = btn;
+}
+
+- (void)applyGroupByCategory:(BOOL)group
+{
+    if (_groupByCategory == group) return;
+    _groupByCategory = group;
+    [[NSUserDefaults standardUserDefaults] setBool:group forKey:kGroupByCategoryDefault];
+    [self installSortBarButton];
+    [self rebuildFilteredData];
+    [self.tableView reloadData];
+}
+
+#pragma mark - Search
+
+- (void)updateSearchResultsForSearchController:(UISearchController *)searchController
+{
+    NSString *q = searchController.searchBar.text ?: @"";
+    if ([q isEqualToString:self.searchText]) return;
+    self.searchText = q;
+    [self rebuildFilteredData];
+    [self.tableView reloadData];
+}
+
+#pragma mark - Filtering / bucketing
+
+- (BOOL)package:(Package *)pkg matchesQuery:(NSString *)q
+{
+    if (q.length == 0) return YES;
+    NSStringCompareOptions opt = NSCaseInsensitiveSearch | NSDiacriticInsensitiveSearch;
+    if ([pkg.name             rangeOfString:q options:opt].location != NSNotFound) return YES;
+    if ([pkg.shortDescription rangeOfString:q options:opt].location != NSNotFound) return YES;
+    if ([pkg.category         rangeOfString:q options:opt].location != NSNotFound) return YES;
+    return NO;
+}
+
+- (void)rebuildFilteredData
+{
+    NSMutableArray<Package *> *filtered = [NSMutableArray array];
+    for (Package *p in self.allPackagesSorted) {
+        if ([self package:p matchesQuery:self.searchText]) [filtered addObject:p];
+    }
+    self.flatPackages = filtered;
+
+    if (!self.groupByCategory) {
+        self.visibleCategories = nil;
+        self.packagesByCategory = nil;
+        return;
+    }
+
+    NSMutableArray<NSString *> *cats = [NSMutableArray array];
+    NSMutableDictionary<NSString *, NSArray<Package *> *> *bucket = [NSMutableDictionary dictionary];
+    for (NSString *cat in [PackageCatalog categoriesInOrder]) {
+        NSMutableArray<Package *> *inCat = [NSMutableArray array];
+        for (Package *p in filtered) {
+            if ([p.category isEqualToString:cat]) [inCat addObject:p];
+        }
+        if (inCat.count > 0) {
+            [cats addObject:cat];
+            bucket[cat] = inCat;
+        }
+    }
+    self.visibleCategories = cats;
+    self.packagesByCategory = bucket;
+}
+
 #pragma mark - Data source
 
 - (NSInteger)numberOfSectionsInTableView:(UITableView *)tableView
 {
-    return (NSInteger)self.categories.count;
+    if (self.groupByCategory) return (NSInteger)self.visibleCategories.count;
+    return 1;
 }
 
 - (NSInteger)tableView:(UITableView *)tableView numberOfRowsInSection:(NSInteger)section
 {
-    return (NSInteger)self.packagesByCategory[self.categories[section]].count;
+    if (self.groupByCategory) {
+        NSString *cat = self.visibleCategories[section];
+        return (NSInteger)self.packagesByCategory[cat].count;
+    }
+    return (NSInteger)self.flatPackages.count;
 }
 
 - (NSString *)tableView:(UITableView *)tableView titleForHeaderInSection:(NSInteger)section
 {
-    return self.categories[section];
-}
-
-- (NSString *)tableView:(UITableView *)tableView titleForFooterInSection:(NSInteger)section
-{
-    if ([self.categories[section] isEqualToString:@"Beta"]) {
-        return @"⚠︎ Work in progress — these may be unstable or change between builds.";
-    }
+    if (self.groupByCategory) return self.visibleCategories[section];
     return nil;
 }
 
 - (Package *)packageAtIndexPath:(NSIndexPath *)indexPath
 {
-    NSString *category = self.categories[indexPath.section];
-    return self.packagesByCategory[category][indexPath.row];
+    if (self.groupByCategory) {
+        NSString *cat = self.visibleCategories[indexPath.section];
+        return self.packagesByCategory[cat][indexPath.row];
+    }
+    return self.flatPackages[indexPath.row];
 }
 
 - (UITableViewCell *)tableView:(UITableView *)tableView cellForRowAtIndexPath:(NSIndexPath *)indexPath
@@ -98,18 +219,29 @@ static NSString * const kPackageCellID = @"PackageCell";
 
     Package *pkg = [self packageAtIndexPath:indexPath];
 
-    UIImage *icon = [UIImage systemImageNamed:pkg.symbolName];
-    cell.imageView.image = icon;
-    cell.imageView.preferredSymbolConfiguration =
-        [UIImageSymbolConfiguration configurationWithPointSize:24.0 weight:UIImageSymbolWeightRegular];
-    cell.imageView.tintColor = self.view.tintColor;
-
-    cell.textLabel.text = pkg.name;
-    cell.textLabel.font = [UIFont systemFontOfSize:17.0 weight:UIFontWeightSemibold];
-
-    cell.detailTextLabel.text = pkg.shortDescription;
-    cell.detailTextLabel.textColor = UIColor.secondaryLabelColor;
-    cell.detailTextLabel.numberOfLines = 2;
+    // UIListContentConfiguration with a fixed reservedLayoutSize so every
+    // SF Symbol occupies the same horizontal slot regardless of its intrinsic
+    // aspect ratio. Without this, wider glyphs (apps.iphone, antenna.*) push
+    // their text further right than narrower ones (thermometer, sun.max).
+    UIListContentConfiguration *config = [UIListContentConfiguration subtitleCellConfiguration];
+    config.image = [UIImage systemImageNamed:pkg.symbolName];
+    config.imageProperties.preferredSymbolConfiguration =
+        [UIImageSymbolConfiguration configurationWithPointSize:22.0 weight:UIImageSymbolWeightRegular];
+    config.imageProperties.tintColor       = self.view.tintColor;
+    config.imageProperties.reservedLayoutSize = CGSizeMake(34.0, 28.0);
+    config.imageProperties.maximumSize     = CGSizeMake(28.0, 28.0);
+    config.imageToTextPadding              = 14.0;
+    config.text = pkg.name;
+    config.textProperties.font = [UIFont systemFontOfSize:17.0 weight:UIFontWeightSemibold];
+    config.secondaryText = pkg.shortDescription;
+    config.secondaryTextProperties.color = UIColor.secondaryLabelColor;
+    config.secondaryTextProperties.numberOfLines = 2;
+    config.textToSecondaryTextVerticalPadding = 3.0;
+    NSDirectionalEdgeInsets m = config.directionalLayoutMargins;
+    m.top    = 14.0;
+    m.bottom = 14.0;
+    config.directionalLayoutMargins = m;
+    cell.contentConfiguration = config;
 
     cell.accessoryView = [self accessoryViewForPackage:pkg];
     if (!cell.accessoryView) {
@@ -135,6 +267,11 @@ static NSString * const kPackageCellID = @"PackageCell";
         return [self pillWithText:@"Installed"
                        background:[UIColor colorWithRed:0.16 green:0.55 blue:0.32 alpha:0.18]
                         textColor:[UIColor systemGreenColor]];
+    }
+    if ([pkg.category caseInsensitiveCompare:@"Beta"] == NSOrderedSame) {
+        return [self pillWithText:@"BETA"
+                       background:[[UIColor systemPurpleColor] colorWithAlphaComponent:0.18]
+                        textColor:[UIColor systemPurpleColor]];
     }
     if (pkg.isNew) {
         return [self pillWithText:@"NEW"

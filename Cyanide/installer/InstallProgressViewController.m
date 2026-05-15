@@ -23,7 +23,7 @@
 {
     [super viewDidLoad];
     self.overrideUserInterfaceStyle = UIUserInterfaceStyleDark;
-    self.view.backgroundColor = [UIColor colorWithRed:0.08 green:0.09 blue:0.16 alpha:1.0];
+    self.view.backgroundColor = [UIColor colorWithRed:0.02 green:0.05 blue:0.06 alpha:1.0];
     self.title = @"Activity";
     self.modalInPresentation = NO; // user can swipe to dismiss any time
 
@@ -33,7 +33,7 @@
 
     UIView *footer = [[UIView alloc] init];
     footer.translatesAutoresizingMaskIntoConstraints = NO;
-    footer.backgroundColor = [UIColor colorWithRed:0.05 green:0.06 blue:0.11 alpha:1.0];
+    footer.backgroundColor = [UIColor colorWithRed:0.01 green:0.03 blue:0.04 alpha:1.0];
     [self.view addSubview:footer];
 
     UIView *divider = [[UIView alloc] init];

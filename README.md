@@ -8,6 +8,32 @@ an Objective-C iOS app and adds a few reliability fixes for repeated local
 testing. It does not ship the browser-delivered WebKit/dyld parts of the
 original DarkSword chain.
 
+## Install
+
+Open this page on your iPhone/iPad and tap one of the buttons below.
+
+<p align="center">
+  <a href="https://celloserenity.github.io/altdirect/?url=https://raw.githubusercontent.com/zeroxjf/cyanide-ios/main/source.json" target="_blank">
+    <img src="https://github.com/CelloSerenity/altdirect/blob/main/assets/png/AltSource_Blue.png?raw=true" alt="Add AltSource" width="200">
+  </a>
+  <a href="https://github.com/zeroxjf/cyanide-ios/releases/latest" target="_blank">
+    <img src="https://github.com/CelloSerenity/altdirect/blob/main/assets/png/Download_Blue.png?raw=true" alt="Download .ipa" width="200">
+  </a>
+</p>
+
+The **Add AltSource** button opens a chooser that adds Cyanide's repo to
+AltStore, SideStore, Feather, or whichever signer you're already using —
+no manual URL pasting. Future releases show up automatically from there.
+
+The **Download .ipa** button jumps to the latest GitHub Release if you'd
+rather sideload the IPA directly (TrollStore, Sideloadly, etc.).
+
+Manual source URL (if you'd rather paste it yourself):
+
+```text
+https://raw.githubusercontent.com/zeroxjf/cyanide-ios/main/source.json
+```
+
 ## Supported Targets
 
 Tested target range:

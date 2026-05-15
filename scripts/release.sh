@@ -107,34 +107,14 @@ else
     echo "==> MARKETING_VERSION unchanged at $CURRENT_VERSION"
 fi
 
-# 1. Commit if either the user had changes or the bump modified the pbxproj.
-if [ "$TREE_WAS_DIRTY" = "1" ] || [ "$BUMPED" = "1" ]; then
-    if [ -z "$MSG" ]; then
-        if [ "$TREE_WAS_DIRTY" = "0" ] && [ "$BUMPED" = "1" ]; then
-            MSG="Bump version to $NEW_VERSION"
-            echo "==> auto-commit message: $MSG"
-        else
-            echo "error: working tree has changes but no commit message was provided." >&2
-            echo "       pass a message as the first arg, or stash changes." >&2
-            exit 1
-        fi
-    fi
-    echo "==> committing"
-    git add -A
-    git commit -m "$MSG"
-fi
-
-# 2. Push (no-op if already in sync).
-echo "==> pushing $BRANCH"
-git push origin "$BRANCH"
-
-# 3. Build the IPA. build.sh writes build/Cyanide-${VERSION}.ipa and
-#    refreshes a build/Cyanide.ipa symlink pointing at it.
+# 1. Build the IPA against the (newly bumped) MARKETING_VERSION. build.sh writes
+#    build/Cyanide-${VERSION}.ipa and refreshes a build/Cyanide.ipa symlink.
+#    We build *before* committing so the actual IPA size can be baked into
+#    source.json in the same commit.
 ./scripts/build.sh
 
-# Read the CFBundleShortVersionString that just got compiled into the app —
-# this drives both the IPA filename uploaded to the Release and the default
-# tag. Bump MARKETING_VERSION in the xcodeproj to ship a new version.
+# Read CFBundleShortVersionString from the just-built app — this drives the
+# IPA filename uploaded to the Release and the default tag.
 APP_PATH="$PWD/build/DerivedData/Build/Products/Debug-iphoneos/Cyanide.app"
 VERSION=$(/usr/libexec/PlistBuddy -c "Print :CFBundleShortVersionString" "$APP_PATH/Info.plist" 2>/dev/null || true)
 if [ -z "$VERSION" ]; then
@@ -147,12 +127,75 @@ if [ ! -f "$IPA" ]; then
     echo "error: $IPA not found after build" >&2
     exit 1
 fi
+EFFECTIVE_TAG="${TAG:-v${VERSION}}"
 
-# 4. Tag + release. Default tag is v${VERSION}. Override with TAG=v1.2.3 if you
+# 2. Refresh source.json (AltSource manifest) so AltStore/SideStore clients
+#    pull the new release automatically. Updates version, date, size,
+#    downloadURL on apps[0].versions[0] of source.json at the repo root.
+SOURCE_JSON="source.json"
+if [ -f "$SOURCE_JSON" ]; then
+    IPA_BYTES=$(stat -f%z "$IPA")
+    ORIGIN_URL_FOR_JSON=$(git remote get-url origin 2>/dev/null || true)
+    REPO_SLUG_FOR_JSON=$(echo "$ORIGIN_URL_FOR_JSON" \
+        | sed -E 's#^(https?://[^/]+/|git@[^:]+:)##' \
+        | sed -E 's#\.git$##')
+    DOWNLOAD_URL="https://github.com/${REPO_SLUG_FOR_JSON}/releases/download/${EFFECTIVE_TAG}/Cyanide-${VERSION}.ipa"
+    RELEASE_DATE=$(date '+%Y-%m-%d')
+    echo "==> refreshing $SOURCE_JSON: version=$VERSION size=$IPA_BYTES"
+    python3 - <<PY
+import json
+path = "$SOURCE_JSON"
+with open(path) as f:
+    data = json.load(f)
+ver = data["apps"][0]["versions"][0]
+ver["version"]     = "$VERSION"
+ver["date"]        = "$RELEASE_DATE"
+ver["size"]        = $IPA_BYTES
+ver["downloadURL"] = "$DOWNLOAD_URL"
+with open(path, "w") as f:
+    json.dump(data, f, indent=2)
+    f.write("\n")
+PY
+fi
+
+# 3. Commit if there's anything to commit: pre-existing tree changes, the
+#    MARKETING_VERSION bump, or the source.json refresh.
+NEEDS_COMMIT=0
+if [ "$TREE_WAS_DIRTY" = "1" ] || [ "$BUMPED" = "1" ]; then
+    NEEDS_COMMIT=1
+elif ! git diff-index --quiet HEAD --; then
+    # source.json may have changed even when the version didn't, e.g. when
+    # downloading and re-uploading the same TAG with a different binary.
+    NEEDS_COMMIT=1
+fi
+if [ "$NEEDS_COMMIT" = "1" ]; then
+    if [ -z "$MSG" ]; then
+        if [ "$TREE_WAS_DIRTY" = "0" ] && [ "$BUMPED" = "1" ]; then
+            MSG="Bump version to $NEW_VERSION"
+            echo "==> auto-commit message: $MSG"
+        elif [ "$TREE_WAS_DIRTY" = "0" ]; then
+            MSG="Refresh source.json for $EFFECTIVE_TAG"
+            echo "==> auto-commit message: $MSG"
+        else
+            echo "error: working tree has changes but no commit message was provided." >&2
+            echo "       pass a message as the first arg, or stash changes." >&2
+            exit 1
+        fi
+    fi
+    echo "==> committing"
+    git add -A
+    git commit -m "$MSG"
+fi
+
+# 4. Push (no-op if already in sync).
+echo "==> pushing $BRANCH"
+git push origin "$BRANCH"
+
+# 5. Tag + release. Default tag is v${VERSION}. Override with TAG=v1.2.3 if you
 #    need an off-cycle tag.
 HASH=$(git rev-parse --short HEAD)
 HEAD_SHA=$(git rev-parse HEAD)
-TAG="${TAG:-v${VERSION}}"
+TAG="$EFFECTIVE_TAG"
 SUBJECT=$(git log -1 --pretty=%s)
 
 # Release notes: explicit second arg > NOTES_FILE > NOTES env > commit subject only.

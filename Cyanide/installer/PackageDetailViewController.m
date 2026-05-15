@@ -11,14 +11,15 @@
 
 typedef NS_ENUM(NSInteger, PackageDetailSection) {
     PackageDetailSectionInfo = 0,
-    PackageDetailSectionDescription,
     PackageDetailSectionAction,
+    PackageDetailSectionDescription,
     PackageDetailSectionCount,
 };
 
 @interface PackageDetailViewController ()
 @property (nonatomic, strong) Package *package;
 @property (nonatomic, copy)   NSArray<NSArray<NSString *> *> *infoRows; // [[label, value], ...]
+@property (nonatomic, copy)   NSArray<NSNumber *> *visibleSections;     // ordered PackageDetailSection values
 @end
 
 @implementation PackageDetailViewController
@@ -33,8 +34,20 @@ typedef NS_ENUM(NSInteger, PackageDetailSection) {
             @[@"Author",   package.author],
             @[@"Category", package.category],
         ];
+        NSMutableArray<NSNumber *> *sections = [NSMutableArray array];
+        [sections addObject:@(PackageDetailSectionInfo)];
+        if (package.settingsSection != NSIntegerMax) {
+            [sections addObject:@(PackageDetailSectionAction)];
+        }
+        [sections addObject:@(PackageDetailSectionDescription)];
+        _visibleSections = sections;
     }
     return self;
+}
+
+- (PackageDetailSection)sectionAtIndex:(NSInteger)index
+{
+    return (PackageDetailSection)[self.visibleSections[index] integerValue];
 }
 
 - (BOOL)hasSettingsBundle
@@ -214,15 +227,15 @@ typedef NS_ENUM(NSInteger, PackageDetailSection) {
 
 - (NSInteger)numberOfSectionsInTableView:(UITableView *)tableView
 {
-    return PackageDetailSectionCount;
+    return (NSInteger)self.visibleSections.count;
 }
 
 - (NSInteger)tableView:(UITableView *)tableView numberOfRowsInSection:(NSInteger)section
 {
-    switch ((PackageDetailSection)section) {
+    switch ([self sectionAtIndex:section]) {
         case PackageDetailSectionInfo:        return (NSInteger)self.infoRows.count;
+        case PackageDetailSectionAction:      return 1;
         case PackageDetailSectionDescription: return 1;
-        case PackageDetailSectionAction:      return [self hasSettingsBundle] ? 1 : 0;
         case PackageDetailSectionCount:       return 0;
     }
     return 0;
@@ -230,26 +243,26 @@ typedef NS_ENUM(NSInteger, PackageDetailSection) {
 
 - (NSString *)tableView:(UITableView *)tableView titleForHeaderInSection:(NSInteger)section
 {
-    switch ((PackageDetailSection)section) {
+    switch ([self sectionAtIndex:section]) {
         case PackageDetailSectionInfo:        return @"Information";
+        case PackageDetailSectionAction:      return @"Configure";
         case PackageDetailSectionDescription: return @"Description";
-        case PackageDetailSectionAction:      return [self hasSettingsBundle] ? @"Configure" : nil;
         case PackageDetailSectionCount:       return nil;
     }
     return nil;
 }
 
-- (CGFloat)tableView:(UITableView *)tableView heightForHeaderInSection:(NSInteger)section
+- (NSString *)tableView:(UITableView *)tableView titleForFooterInSection:(NSInteger)section
 {
-    if ((PackageDetailSection)section == PackageDetailSectionAction && ![self hasSettingsBundle]) {
-        return CGFLOAT_MIN;
+    if ([self sectionAtIndex:section] == PackageDetailSectionAction) {
+        return @"Settings can be changed any time — before or after install. Configuring before install is best so the tweak applies with your options on the very next run.";
     }
-    return UITableViewAutomaticDimension;
+    return nil;
 }
 
 - (UITableViewCell *)tableView:(UITableView *)tableView cellForRowAtIndexPath:(NSIndexPath *)indexPath
 {
-    switch ((PackageDetailSection)indexPath.section) {
+    switch ([self sectionAtIndex:indexPath.section]) {
         case PackageDetailSectionInfo: {
             UITableViewCell *cell = [tableView dequeueReusableCellWithIdentifier:@"InfoCell"];
             if (!cell) {
@@ -301,7 +314,7 @@ typedef NS_ENUM(NSInteger, PackageDetailSection) {
 - (void)tableView:(UITableView *)tableView didSelectRowAtIndexPath:(NSIndexPath *)indexPath
 {
     [tableView deselectRowAtIndexPath:indexPath animated:YES];
-    if ((PackageDetailSection)indexPath.section != PackageDetailSectionAction) return;
+    if ([self sectionAtIndex:indexPath.section] != PackageDetailSectionAction) return;
     if (![self hasSettingsBundle]) return;
 
     UITabBarController *tab = self.tabBarController;
@@ -323,6 +336,7 @@ typedef NS_ENUM(NSInteger, PackageDetailSection) {
     [settingsNav popToRootViewControllerAnimated:NO];
     SettingsViewController *bundle = [[SettingsViewController alloc] initWithUnderlyingSection:self.package.settingsSection
                                                                                    bundleTitle:self.package.name];
+    bundle.installerReturnPackageName = self.package.name;
     [settingsNav pushViewController:bundle animated:NO];
     tab.selectedIndex = settingsIndex;
 }
