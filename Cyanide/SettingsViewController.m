@@ -24,6 +24,13 @@
 #import <sys/utsname.h>
 #import <time.h>
 #import <unistd.h>
+#import <mach/mach.h>
+#import <mach-o/loader.h>
+#import <mach-o/dyld_images.h>
+#import <mach-o/fat.h>
+#import <sys/sysctl.h>
+#import <libproc.h>
+#import <SSZipArchive/SSZipArchive.h>
 
 @interface DSRespringViewController : UIViewController <WKNavigationDelegate>
 @property (nonatomic, strong) WKWebView *webView;
@@ -153,10 +160,6 @@ static NSString * const kSettingsRemoteCallStateDidChangeNotification = @"Settin
 NSString * const kSettingsActionsDidCompleteNotification = @"SettingsActionsDidCompleteNotification";
 static NSArray<NSString *> * const kPowercuffLevels = nil;
 
-// Session-scoped record of which tweaks were actually applied since launch.
-// Distinct from the persisted NSUserDefaults enable flag — these are wiped on
-// app launch and whenever the SpringBoard RemoteCall session is torn down, so
-// the UI can show accurate "Installed" state rather than a stale toggle.
 static NSMutableSet<NSString *> *g_applied_tweak_keys = nil;
 
 static NSMutableSet<NSString *> *settings_applied_keys_set(void)
@@ -268,9 +271,6 @@ static void settings_notify_remote_call_state_changed(void);
 static void settings_request_all_live_loops_stop(const char *reason);
 
 static BOOL settings_should_log_statbar_tick(NSUInteger tick) {
-    // One-shot: log the very first tick so the user can see the loop took
-    // off, then go silent forever. The polling continues; we just stop
-    // narrating it.
     return tick == 0;
 }
 
@@ -350,16 +350,10 @@ static BOOL settings_statbar_screen_awake(void)
 
 static void settings_handle_springboard_restart(void)
 {
-    // SpringBoard just (re)started. Every pointer we cached from the previous
-    // SB incarnation — class addresses, selector slots, retained objects,
-    // ivar offsets, the trojan thread, our shmem map — is stale. Calling
-    // through any of them under SB-2 hands a wild signed function pointer to
-    // BLRAA and PAC-faults us. Drop everything before the next loop tick.
     dispatch_async(dispatch_get_global_queue(QOS_CLASS_USER_INITIATED, 0), ^{
         BOOL hadSession = NO;
         @synchronized (settings_rc_lock()) {
             hadSession = (g_springboard_rc_ready != 0);
-            // Tell live loops to bail at their next interval check.
             settings_request_all_live_loops_stop("SpringBoard restart");
             g_springboard_rc_ready = 0;
             g_springboard_sandbox_escaped = 0;
@@ -408,10 +402,6 @@ static void settings_install_screen_awake_observers(void)
             g_display_status_notify_token = NOTIFY_TOKEN_INVALID;
         }
 
-        // Darwin notify fires when SpringBoard finishes its boot/respawn.
-        // Either we just launched and SB is fine (cleanup is a no-op against
-        // already-zero state) or SB crashed under us and we MUST drop every
-        // cached pointer before the live loops fire again into SB-2.
         status = notify_register_dispatch("com.apple.springboard.finishedstartup",
                                           &g_springboard_finished_startup_notify_token,
                                           dispatch_get_main_queue(), ^(int token) {
@@ -422,9 +412,6 @@ static void settings_install_screen_awake_observers(void)
             g_springboard_finished_startup_notify_token = NOTIFY_TOKEN_INVALID;
         }
 
-        // If the live loop tripped its 3-failure exit during a background
-        // window, the screen-wake darwin notifications won't fire (the screen
-        // never blanked) and the loop stays dead. Re-arm on app foreground.
         [[NSNotificationCenter defaultCenter] addObserverForName:UIApplicationDidBecomeActiveNotification
                                                           object:nil
                                                            queue:[NSOperationQueue mainQueue]
@@ -458,10 +445,6 @@ static void settings_end_statbar_background_task_async(const char *reason)
     }
 }
 
-// Bridge the foreground -> background transition with a short explicit
-// UIBackgroundTask. DSKeepAlive's audio background mode carries the ongoing
-// live feed; holding a UIBackgroundTask indefinitely trips UIKit's 30s watchdog
-// warning and can get the app terminated.
 static void settings_begin_statbar_background_task_async(const char *reason)
 {
     void (^beginTask)(void) = ^{
@@ -1045,8 +1028,6 @@ static void settings_start_statbar_live_loop(void)
     if (![d boolForKey:kSettingsStatBarEnabled]) return;
 
     if (__sync_lock_test_and_set(&g_statbar_live_running, 1)) {
-        // Log-once for the process lifetime; further "already running" hits
-        // during foreground/background lifecycle churn are pure noise.
         static volatile int loggedAlready = 0;
         if (__sync_bool_compare_and_swap(&loggedAlready, 0, 1)) {
             printf("[SETTINGS] StatBar live loop already running\n");
@@ -1198,8 +1179,6 @@ static void settings_apply_statbar_once_async(const char *reason)
             ok = statbar_apply_in_session([d boolForKey:kSettingsStatBarCelsius],
                                           [d boolForKey:kSettingsStatBarHideNet]);
         }
-        // Only log lifecycle applies that change result; a clean success on
-        // every foreground/background flip is noise.
         static volatile int lastResult = -1;
         int now = ok ? 1 : 0;
         if (now != lastResult) {
@@ -1407,11 +1386,6 @@ static void settings_start_axonlite_live_loop(void)
                    tick < kAxonLiteLiveMaxTicks) {
                 useconds_t intervalUS = settings_live_interval(kAxonLiteLiveIntervalUS,
                                                                kAxonLiteLiveBackgroundIntervalUS);
-                // While the screen is blank, SB tears down cover-sheet view
-                // controllers to free memory. Calling into our cached
-                // gAxonCLVC etc during that window risks dereferencing freed
-                // objects (the PAC-fault path we keep hitting). Pause until
-                // the screen wakes; on wake the loop re-finds CLVC fresh.
                 if (!settings_statbar_screen_awake()) {
                     if (!pausedForSleep) {
                         pausedForSleep = YES;
@@ -1426,9 +1400,6 @@ static void settings_start_axonlite_live_loop(void)
                 if (pausedForSleep) {
                     pausedForSleep = NO;
                     printf("[SETTINGS] Axon Lite resumed after screen wake\n");
-                    // SB likely rebuilt the cover sheet during the blank
-                    // window; the cached CLVC we held is stale. Drop it so
-                    // the next tick walks the windows again.
                     axonlite_forget_remote_state();
                 }
 
@@ -1811,9 +1782,8 @@ void settings_register_defaults(void)
         kSettingsRSSIDisplayCell:    @YES,
 
         kSettingsAxonLiteEnabled: @NO,
+        kSettingsLogUploadEnabled: @NO,
     }];
-    // Signal Readouts is temporarily blocked from installation because its
-    // live RemoteCall refresh still interferes with other SpringBoard tweaks.
     if ([defaults boolForKey:kSettingsRSSIDisplayEnabled]) {
         [defaults setBool:NO forKey:kSettingsRSSIDisplayEnabled];
         [defaults synchronize];
@@ -2028,11 +1998,6 @@ void settings_run_actions(void)
 
                     if (runAxonLite) {
                         settings_progress(&step, total, "Starting Axon Lite notification hub");
-                        // First call: force the cover-sheet chain to
-                        // materialize and bind data sources.
-                        // Subsequent calls: let the now-populated CLVC
-                        // settle through the model → cache → bundles
-                        // pipeline before the user opens the lock screen.
                         bool ok = false;
                         for (int i = 0; i < 3; i++) {
                             bool tickOK = axonlite_apply_in_session();
@@ -2098,6 +2063,7 @@ typedef NS_ENUM(NSInteger, SettingsSection) {
     SectionPowercuff,
     SectionDarkSwordTweaks,
     SectionAppDowngrade,
+    SectionAppDecryption,
     SectionCount,
 };
 
@@ -2414,6 +2380,438 @@ static void downgrade_trigger_in_springboard(NSString *trackIdStr, NSString *ver
 }
 @end
 
+// === App Decryption Core ===
+
+kern_return_t mach_vm_read_overwrite(vm_map_read_t target_task, mach_vm_address_t address, mach_vm_size_t size, mach_vm_address_t data, mach_vm_size_t *outsize);
+kern_return_t mach_vm_region(vm_map_read_t target_task, mach_vm_address_t *address, mach_vm_size_t *size, vm_region_flavor_t flavor, vm_region_info_t info, mach_msg_type_number_t *infoCnt, mach_port_t *object_name);
+
+typedef struct MainImageInfo {
+    uint64_t loadAddress;
+    NSString *path;
+    BOOL     ok;
+} MainImageInfo_t;
+
+static void removePrefix(char *str, const char *prefix) {
+    size_t len_str = strlen(str);
+    size_t len_prefix = strlen(prefix);
+    if (len_str >= len_prefix && strncmp(str, prefix, len_prefix) == 0) {
+        memmove(str, str + len_prefix, len_str - len_prefix + 1);
+    }
+}
+
+static bool readFully(int fd, void *buffer, size_t size) {
+    size_t totalRead = 0;
+    while (totalRead < size) {
+        ssize_t bytesRead = read(fd, (uint8_t *)buffer + totalRead, size - totalRead);
+        if (bytesRead <= 0) return NO;
+        totalRead += bytesRead;
+    }
+    return YES;
+}
+
+static bool writeFully(int fd, const void *buffer, size_t size) {
+    size_t totalWritten = 0;
+    while (totalWritten < size) {
+        ssize_t bytesWritten = write(fd, (const uint8_t *)buffer + totalWritten, size - totalWritten);
+        if (bytesWritten <= 0) return NO;
+        totalWritten += bytesWritten;
+    }
+    return YES;
+}
+
+static BOOL readProcessMemory(vm_map_t task, uint64_t address, void *buffer, size_t size) {
+    if (!buffer || size == 0) return NO;
+    kern_return_t kr;
+    mach_vm_address_t regionAddress = address;
+    mach_vm_size_t regionSize = 0;
+    vm_region_basic_info_data_64_t info;
+    mach_msg_type_number_t infoCount = VM_REGION_BASIC_INFO_COUNT_64;
+    mach_port_t objectName = MACH_PORT_NULL;
+    kr = mach_vm_region((task_t)task, &regionAddress, &regionSize, VM_REGION_BASIC_INFO_64, (vm_region_info_t)&info, &infoCount, &objectName);
+    if (kr != KERN_SUCCESS || !(info.protection & VM_PROT_READ)) return NO;
+    if (address + size > regionAddress + regionSize) return NO;
+    mach_vm_size_t outSize = 0;
+    kr = mach_vm_read_overwrite((task_t)task, address, size, (mach_vm_address_t)buffer, &outSize);
+    if (kr != KERN_SUCCESS || outSize != size) return NO;
+    return YES;
+}
+
+static MainImageInfo_t imageInfoForPIDWithRetry(const char *sourcePath, vm_map_t task, pid_t pid) {
+    for (int i = 0; i < 300; i++) {
+        task_dyld_info_data_t taskInfo;
+        mach_msg_type_number_t count = TASK_DYLD_INFO_COUNT;
+        kern_return_t kr = task_info((task_t)task, TASK_DYLD_INFO, (task_info_t)&taskInfo, &count);
+        if (kr != KERN_SUCCESS || taskInfo.all_image_info_addr == 0) { usleep(10000); continue; }
+        struct dyld_all_image_infos infos = {0};
+        if (!readProcessMemory(task, taskInfo.all_image_info_addr, &infos, sizeof(infos))) { usleep(10000); continue; }
+        if (infos.infoArrayCount == 0 || infos.infoArray == NULL || infos.dyldImageLoadAddress == NULL) { usleep(10000); continue; }
+        mach_vm_size_t imageInfoSize = sizeof(struct dyld_image_info) * infos.infoArrayCount;
+        void *imageInfoData = malloc(imageInfoSize);
+        if (!readProcessMemory(task, (mach_vm_address_t)infos.infoArray, imageInfoData, imageInfoSize)) {
+            free(imageInfoData); usleep(10000); continue;
+        }
+        struct dyld_image_info *imageInfos = (struct dyld_image_info *)imageInfoData;
+        for (uint32_t j = 0; j < infos.infoArrayCount; j++) {
+            char pathBuffer[PATH_MAX] = {0};
+            if (!readProcessMemory(task, (uint64_t)imageInfos[j].imageFilePath, pathBuffer, sizeof(pathBuffer) - 1)) continue;
+            bool match = strcmp(pathBuffer, sourcePath) == 0;
+            if (!match) removePrefix(pathBuffer, "/private");
+            if (strcmp(pathBuffer, sourcePath) == 0) {
+                NSString *pathString = [NSString stringWithUTF8String:pathBuffer];
+                MainImageInfo_t result = { .loadAddress = (mach_vm_address_t)imageInfos[j].imageLoadAddress, .path = pathString, .ok = YES };
+                free(imageInfoData);
+                return result;
+            }
+        }
+        free(imageInfoData);
+    }
+    return (MainImageInfo_t){.ok = NO};
+}
+
+static BOOL readEncryptionInfo(vm_map_t task, uint64_t address, struct encryption_info_command *encryptionInfo, uint64_t *loadCommandAddress) {
+    if (!encryptionInfo || !loadCommandAddress) return NO;
+    struct mach_header_64 machHeader;
+    if (!readProcessMemory(task, address, &machHeader, sizeof(machHeader))) return NO;
+    uint64_t offset = 0;
+    if (machHeader.magic == MH_MAGIC_64) offset = sizeof(struct mach_header_64);
+    else if (machHeader.magic == MH_MAGIC) offset = sizeof(struct mach_header);
+    else return NO;
+    if (machHeader.ncmds == 0) return NO;
+    for (uint32_t i = 0; i < machHeader.ncmds; i++) {
+        struct load_command loadCommand;
+        if (!readProcessMemory(task, address + offset, &loadCommand, sizeof(loadCommand))) return NO;
+        if (loadCommand.cmd == LC_ENCRYPTION_INFO || loadCommand.cmd == LC_ENCRYPTION_INFO_64) {
+            struct encryption_info_command encInfo;
+            if (!readProcessMemory(task, address + offset, &encInfo, sizeof(encInfo))) return NO;
+            *encryptionInfo = encInfo;
+            *loadCommandAddress = address + offset;
+            return YES;
+        }
+        offset += loadCommand.cmdsize;
+    }
+    return YES;
+}
+
+static BOOL rebuildDecryptedImageAtPath(NSString *sourcePath, vm_map_t task, uint64_t loadAddress, struct encryption_info_command *encryptionInfo, uint64_t loadCommandAddress, NSString *outputPath) {
+    if (!encryptionInfo) return NO;
+    uint32_t cryptoff  = encryptionInfo->cryptoff;
+    uint32_t cryptsize = encryptionInfo->cryptsize;
+    int fd = open(sourcePath.UTF8String, O_RDONLY);
+    if (fd < 0) return NO;
+    off_t fileSize = lseek(fd, 0, SEEK_END);
+    if (fileSize < 0) { close(fd); return NO; }
+    lseek(fd, 0, SEEK_SET);
+    uint64_t cryptEnd = (uint64_t)cryptoff + (uint64_t)cryptsize;
+    if (cryptEnd > (uint64_t)fileSize) { close(fd); return NO; }
+    int outputFd = open(outputPath.UTF8String, O_RDWR | O_CREAT | O_TRUNC, 0644);
+    if (outputFd < 0) { close(fd); return NO; }
+    if (lseek(fd, 0, SEEK_SET) < 0) { close(fd); close(outputFd); return NO; }
+    if (cryptoff > 0) {
+        void *leading = malloc(cryptoff);
+        if (!leading || !readFully(fd, leading, cryptoff) || !writeFully(outputFd, leading, cryptoff)) {
+            if(leading) free(leading); close(fd); close(outputFd); return NO;
+        }
+        free(leading);
+    }
+    if (cryptsize > 0) {
+        void *decrypted = malloc(cryptsize);
+        if (!decrypted || !readProcessMemory(task, loadAddress + (uint64_t)cryptoff, decrypted, cryptsize) || !writeFully(outputFd, decrypted, cryptsize)) {
+            if(decrypted) free(decrypted); close(fd); close(outputFd); return NO;
+        }
+        free(decrypted);
+    }
+    uint64_t trailingSize = (uint64_t)fileSize - cryptEnd;
+    if (trailingSize > 0) {
+        uint8_t *buf = malloc((1 << 20));
+        if (!buf || lseek(fd, (off_t)cryptEnd, SEEK_SET) < 0) {
+            if(buf) free(buf); close(fd); close(outputFd); return NO;
+        }
+        uint64_t left = trailingSize;
+        while (left > 0) {
+            size_t toRead = (left > (1 << 20)) ? (1 << 20) : (size_t)left;
+            if (!readFully(fd, buf, toRead) || !writeFully(outputFd, buf, toRead)) {
+                free(buf); close(fd); close(outputFd); return NO;
+            }
+            left -= toRead;
+        }
+        free(buf);
+    }
+    if (loadCommandAddress) {
+        off_t cmdOff = (off_t)((uint64_t)loadCommandAddress - (uint64_t)loadAddress);
+        if (lseek(outputFd, cmdOff, SEEK_SET) < 0) { close(fd); close(outputFd); return NO; }
+        struct encryption_info_command outputEncInfo = {0};
+        if (!readFully(outputFd, &outputEncInfo, sizeof(outputEncInfo))) { close(fd); close(outputFd); return NO; }
+        outputEncInfo.cryptid = 0;
+        if (lseek(outputFd, cmdOff, SEEK_SET) < 0 || !writeFully(outputFd, &outputEncInfo, sizeof(outputEncInfo))) {
+            close(fd); close(outputFd); return NO;
+        }
+    }
+    close(fd);
+    close(outputFd);
+    return YES;
+}
+
+static pid_t get_pid_by_exec_name(NSString *execName) {
+    int mib[4] = {CTL_KERN, KERN_PROC, KERN_PROC_ALL, 0};
+    size_t size;
+    if (sysctl(mib, 4, NULL, &size, NULL, 0) < 0) return 0;
+    struct kinfo_proc *kp = malloc(size);
+    if (sysctl(mib, 4, kp, &size, NULL, 0) < 0) { free(kp); return 0; }
+    int count = size / sizeof(struct kinfo_proc);
+    pid_t ret = 0;
+    for (int i = 0; i < count; i++) {
+        pid_t pid = kp[i].kp_proc.p_pid;
+        if (pid <= 0) continue;
+        NSString *comm = [NSString stringWithUTF8String:kp[i].kp_proc.p_comm];
+        if ([execName hasPrefix:comm]) {
+            char pathBuffer[PROC_PIDPATHINFO_MAXSIZE];
+            if (proc_pidpath(pid, pathBuffer, sizeof(pathBuffer)) > 0) {
+                NSString *path = [NSString stringWithUTF8String:pathBuffer];
+                if ([[path lastPathComponent] isEqualToString:execName]) {
+                    ret = pid;
+                    break;
+                }
+            } else if (execName.length <= 15 && [execName isEqualToString:comm]) {
+                ret = pid;
+                break;
+            }
+        }
+    }
+    free(kp);
+    return ret;
+}
+
+@interface CyanideDecryptionTask : NSObject
+@property (nonatomic, strong) NSString *bundleId;
+@property (nonatomic, strong) NSString *appBundlePath;
+@property (nonatomic, strong) NSString *executablePath;
+@property (nonatomic, strong) NSString *appName;
+@property (nonatomic, copy) void (^progressHandler)(NSString *progress);
+- (void)executeWithCompletionHandler:(void (^)(BOOL success, NSURL *outputURL, NSError *error))completionHandler;
+@end
+
+#define DECRYPT_WORK_PATH @"/var/mobile/Documents/CyanideDecrypt"
+
+@implementation CyanideDecryptionTask
+- (void)executeWithCompletionHandler:(void (^)(BOOL success, NSURL *outputURL, NSError *error))completionHandler {
+    dispatch_async(dispatch_get_global_queue(0, 0), ^{
+        if (!settings_ensure_kexploit()) {
+            dispatch_async(dispatch_get_main_queue(), ^{ if(completionHandler) completionHandler(NO, nil, [NSError errorWithDomain:@"Cyanide" code:1 userInfo:@{NSLocalizedDescriptionKey:@"Failed to acquire kernel primitives"}]); });
+            return;
+        }
+        
+        if (!g_springboard_sandbox_escaped) {
+            escape_sbx_demo2();
+        }
+
+        NSFileManager *fm = [NSFileManager defaultManager];
+        [fm createDirectoryAtPath:DECRYPT_WORK_PATH withIntermediateDirectories:YES attributes:nil error:nil];
+
+        NSString *workDir = [DECRYPT_WORK_PATH stringByAppendingPathComponent:@".work"];
+        [fm removeItemAtPath:workDir error:nil];
+        
+        NSString *payloadDir = [workDir stringByAppendingPathComponent:@"Payload"];
+        [fm createDirectoryAtPath:payloadDir withIntermediateDirectories:YES attributes:nil error:nil];
+
+        if (self.progressHandler) self.progressHandler(@"Copying Application Bundle...");
+        
+        NSString *destAppPath = [payloadDir stringByAppendingPathComponent:[self.appBundlePath lastPathComponent]];
+        NSError *err;
+        if (![fm copyItemAtPath:self.appBundlePath toPath:destAppPath error:&err]) {
+            dispatch_async(dispatch_get_main_queue(), ^{ if(completionHandler) completionHandler(NO, nil, err); });
+            return;
+        }
+
+        if (self.progressHandler) self.progressHandler(@"Launching Application...");
+
+        Class lsaw = objc_getClass("LSApplicationWorkspace");
+        id workspace = [lsaw performSelector:@selector(defaultWorkspace)];
+        [workspace performSelector:@selector(openApplicationWithBundleID:) withObject:self.bundleId];
+
+        pid_t pid = 0;
+        for (int i=0; i<50; i++) {
+            pid = get_pid_by_exec_name([self.executablePath lastPathComponent]);
+            if (pid > 0) break;
+            usleep(100000);
+        }
+
+        if (pid <= 0) {
+            dispatch_async(dispatch_get_main_queue(), ^{ if(completionHandler) completionHandler(NO, nil, [NSError errorWithDomain:@"Cyanide" code:1 userInfo:@{NSLocalizedDescriptionKey:@"Failed to launch app"}]); });
+            return;
+        }
+
+        if (self.progressHandler) self.progressHandler(@"Decrypting Binary...");
+
+        vm_map_t task = 0;
+        if (task_for_pid(mach_task_self(), pid, &task) != KERN_SUCCESS) {
+            kill(pid, SIGKILL);
+            dispatch_async(dispatch_get_main_queue(), ^{ if(completionHandler) completionHandler(NO, nil, [NSError errorWithDomain:@"Cyanide" code:2 userInfo:@{NSLocalizedDescriptionKey:@"Failed to get task_for_pid (Requires kernel patch)"}]); });
+            return;
+        }
+
+        MainImageInfo_t mainImageInfo = imageInfoForPIDWithRetry([self.executablePath UTF8String], task, pid);
+        if (!mainImageInfo.ok) {
+            kill(pid, SIGKILL);
+            dispatch_async(dispatch_get_main_queue(), ^{ if(completionHandler) completionHandler(NO, nil, [NSError errorWithDomain:@"Cyanide" code:3 userInfo:@{NSLocalizedDescriptionKey:@"Failed to find image base"}]); });
+            return;
+        }
+
+        struct encryption_info_command encryptionInfo = {0};
+        uint64_t loadCommandAddress = 0;
+        if (!readEncryptionInfo(task, mainImageInfo.loadAddress, &encryptionInfo, &loadCommandAddress)) {
+            kill(pid, SIGKILL);
+            dispatch_async(dispatch_get_main_queue(), ^{ if(completionHandler) completionHandler(NO, nil, [NSError errorWithDomain:@"Cyanide" code:4 userInfo:@{NSLocalizedDescriptionKey:@"Failed to read encryption info"}]); });
+            return;
+        }
+
+        if (encryptionInfo.cryptid != 0) {
+            NSString *targetExePath = [destAppPath stringByAppendingPathComponent:[self.executablePath lastPathComponent]];
+            if (!rebuildDecryptedImageAtPath(self.executablePath, task, mainImageInfo.loadAddress, &encryptionInfo, loadCommandAddress, targetExePath)) {
+                kill(pid, SIGKILL);
+                dispatch_async(dispatch_get_main_queue(), ^{ if(completionHandler) completionHandler(NO, nil, [NSError errorWithDomain:@"Cyanide" code:5 userInfo:@{NSLocalizedDescriptionKey:@"Failed to rebuild decrypted binary"}]); });
+                return;
+            }
+        }
+
+        kill(pid, SIGKILL);
+
+        if (self.progressHandler) self.progressHandler(@"Building IPA...");
+
+        NSString *ipaName = [NSString stringWithFormat:@"%@_Decrypted.ipa", self.appName];
+        NSString *ipaPath = [DECRYPT_WORK_PATH stringByAppendingPathComponent:ipaName];
+        [fm removeItemAtPath:ipaPath error:nil];
+
+        BOOL success = [SSZipArchive createZipFileAtPath:ipaPath withContentsOfDirectory:workDir];
+        [fm removeItemAtPath:workDir error:nil];
+
+        if (!success) {
+            dispatch_async(dispatch_get_main_queue(), ^{ if(completionHandler) completionHandler(NO, nil, [NSError errorWithDomain:@"Cyanide" code:6 userInfo:@{NSLocalizedDescriptionKey:@"Failed to create ZIP archive"}]); });
+            return;
+        }
+
+        dispatch_async(dispatch_get_main_queue(), ^{ if(completionHandler) completionHandler(YES, [NSURL fileURLWithPath:ipaPath], nil); });
+    });
+}
+@end
+
+@interface AppDecryptionListViewController : UITableViewController
+@property (nonatomic, strong) NSArray *apps;
+@end
+
+@implementation AppDecryptionListViewController
+- (void)viewDidLoad {
+    [super viewDidLoad];
+    self.title = @"Select App to Decrypt";
+    self.tableView.rowHeight = 60;
+    dispatch_async(dispatch_get_global_queue(0, 0), ^{
+        if (!g_springboard_sandbox_escaped) {
+            escape_sbx_demo2();
+        }
+        NSString *appsPath = @"/var/containers/Bundle/Application";
+        NSFileManager *fm = [NSFileManager defaultManager];
+        NSArray *appDirs = [fm contentsOfDirectoryAtPath:appsPath error:nil];
+        NSMutableArray *userApps = [NSMutableArray array];
+        for (NSString *uuidDir in appDirs) {
+            NSString *appGroupPath = [appsPath stringByAppendingPathComponent:uuidDir];
+            NSArray *subContents = [fm contentsOfDirectoryAtPath:appGroupPath error:nil];
+            for (NSString *sub in subContents) {
+                if ([sub hasSuffix:@".app"]) {
+                    NSString *appBundlePath = [appGroupPath stringByAppendingPathComponent:sub];
+                    NSString *infoPlistPath = [appBundlePath stringByAppendingPathComponent:@"Info.plist"];
+                    NSDictionary *info = [NSDictionary dictionaryWithContentsOfFile:infoPlistPath];
+                    if (info && info[@"CFBundleIdentifier"]) {
+                        NSMutableDictionary *mInfo = [info mutableCopy];
+                        mInfo[@"AppBundlePath"] = appBundlePath;
+                        NSString *exec = info[@"CFBundleExecutable"];
+                        if (exec) {
+                            mInfo[@"ExecutablePath"] = [appBundlePath stringByAppendingPathComponent:exec];
+                        }
+                        [userApps addObject:mInfo];
+                    }
+                }
+            }
+        }
+        [userApps sortUsingComparator:^NSComparisonResult(NSDictionary *obj1, NSDictionary *obj2) {
+            NSString *name1 = obj1[@"CFBundleDisplayName"] ?: obj1[@"CFBundleName"] ?: obj1[@"CFBundleIdentifier"];
+            NSString *name2 = obj2[@"CFBundleDisplayName"] ?: obj2[@"CFBundleName"] ?: obj2[@"CFBundleIdentifier"];
+            return [name1 localizedCaseInsensitiveCompare:name2];
+        }];
+        dispatch_async(dispatch_get_main_queue(), ^{
+            self.apps = userApps;
+            [self.tableView reloadData];
+        });
+    });
+}
+- (NSInteger)tableView:(UITableView *)tableView numberOfRowsInSection:(NSInteger)section {
+    return self.apps.count;
+}
+- (UITableViewCell *)tableView:(UITableView *)tableView cellForRowAtIndexPath:(NSIndexPath *)indexPath {
+    UITableViewCell *cell = [tableView dequeueReusableCellWithIdentifier:@"DecAppCell"];
+    if (!cell) cell = [[UITableViewCell alloc] initWithStyle:UITableViewCellStyleSubtitle reuseIdentifier:@"DecAppCell"];
+    NSDictionary *appInfo = self.apps[indexPath.row];
+    NSString *name = appInfo[@"CFBundleDisplayName"] ?: appInfo[@"CFBundleName"] ?: appInfo[@"CFBundleIdentifier"];
+    cell.textLabel.text = name;
+    cell.detailTextLabel.text = appInfo[@"CFBundleIdentifier"];
+    return cell;
+}
+- (void)tableView:(UITableView *)tableView didSelectRowAtIndexPath:(NSIndexPath *)indexPath {
+    [tableView deselectRowAtIndexPath:indexPath animated:YES];
+    NSDictionary *appInfo = self.apps[indexPath.row];
+    NSString *bundleId = appInfo[@"CFBundleIdentifier"];
+    NSString *appBundlePath = appInfo[@"AppBundlePath"];
+    NSString *executablePath = appInfo[@"ExecutablePath"];
+    NSString *appName = appInfo[@"CFBundleDisplayName"] ?: appInfo[@"CFBundleName"] ?: bundleId;
+    
+    if (!appBundlePath || !executablePath) return;
+    
+    UIAlertController *alert = [UIAlertController alertControllerWithTitle:@"Decrypt App" message:[NSString stringWithFormat:@"Do you want to decrypt %@?", appName] preferredStyle:UIAlertControllerStyleAlert];
+    [alert addAction:[UIAlertAction actionWithTitle:@"Cancel" style:UIAlertActionStyleCancel handler:nil]];
+    [alert addAction:[UIAlertAction actionWithTitle:@"Decrypt" style:UIAlertActionStyleDefault handler:^(UIAlertAction * _Nonnull action) {
+        
+        InstallProgressViewController *logVC = [[InstallProgressViewController alloc] init];
+        UINavigationController *logNav = [[UINavigationController alloc] initWithRootViewController:logVC];
+        logNav.modalPresentationStyle = UIModalPresentationAutomatic;
+        
+        CyanideDecryptionTask *task = [[CyanideDecryptionTask alloc] init];
+        task.bundleId = bundleId;
+        task.appBundlePath = appBundlePath;
+        task.executablePath = executablePath;
+        task.appName = appName;
+        task.progressHandler = ^(NSString *progress) {
+            dispatch_async(dispatch_get_main_queue(), ^{
+                logVC.title = @"Decrypting...";
+            });
+        };
+        
+        [self presentViewController:logNav animated:YES completion:^{
+            [task executeWithCompletionHandler:^(BOOL success, NSURL *outputURL, NSError *error) {
+                dispatch_async(dispatch_get_main_queue(), ^{
+                    [logNav dismissViewControllerAnimated:YES completion:^{
+                        if (success) {
+                            UIAlertController *successAlert = [UIAlertController alertControllerWithTitle:@"Success" message:[NSString stringWithFormat:@"IPA saved to:\n%@", outputURL.path] preferredStyle:UIAlertControllerStyleAlert];
+                            [successAlert addAction:[UIAlertAction actionWithTitle:@"OK" style:UIAlertActionStyleDefault handler:nil]];
+                            
+                            if ([[UIApplication sharedApplication] canOpenURL:[NSURL URLWithString:@"filza://"]]) {
+                                [successAlert addAction:[UIAlertAction actionWithTitle:@"Show in Filza" style:UIAlertActionStyleDefault handler:^(UIAlertAction *a) {
+                                    NSURL *url = [[NSURL URLWithString:@"filza://view"] URLByAppendingPathComponent:[outputURL path]];
+                                    [[UIApplication sharedApplication] openURL:url options:@{} completionHandler:nil];
+                                }]];
+                            }
+                            [self presentViewController:successAlert animated:YES completion:nil];
+                        } else {
+                            UIAlertController *errAlert = [UIAlertController alertControllerWithTitle:@"Error" message:error.localizedDescription preferredStyle:UIAlertControllerStyleAlert];
+                            [errAlert addAction:[UIAlertAction actionWithTitle:@"OK" style:UIAlertActionStyleCancel handler:nil]];
+                            [self presentViewController:errAlert animated:YES completion:nil];
+                        }
+                    }];
+                });
+            }];
+        }];
+    }]];
+    [self presentViewController:alert animated:YES completion:nil];
+}
+@end
+
 @interface SettingsViewController ()
 @property (nonatomic, strong) UISegmentedControl *powercuffSegmented;
 @property (nonatomic, assign) BOOL pendingManualActionsReload;
@@ -2675,6 +3073,7 @@ static void downgrade_trigger_in_springboard(NSString *trackIdStr, NSString *ver
         case SectionRSSI:      return self.rssiRows;
         case SectionAxonLite:  return self.axonLiteRows;
         case SectionAppDowngrade: return @[];
+        case SectionAppDecryption: return @[];
         default: return @[];
     }
 }
@@ -2692,6 +3091,7 @@ static void downgrade_trigger_in_springboard(NSString *trackIdStr, NSString *ver
         @{ @"title": @"Powercuff",          @"icon": @"bolt.slash.fill",                     @"color": [UIColor systemOrangeColor], @"section": @(SectionPowercuff) },
         @{ @"title": @"SpringBoard Tweaks", @"icon": @"apps.iphone",                         @"color": [UIColor systemIndigoColor], @"section": @(SectionDarkSwordTweaks) },
         @{ @"title": @"App Downgrade",      @"icon": @"arrow.down.app.fill",                 @"color": [UIColor systemPurpleColor], @"section": @(SectionAppDowngrade) },
+        @{ @"title": @"App Decryption",     @"icon": @"lock.open.fill",                      @"color": [UIColor systemTealColor],   @"section": @(SectionAppDecryption) },
     ];
 }
 
@@ -2707,7 +3107,7 @@ static void downgrade_trigger_in_springboard(NSString *trackIdStr, NSString *ver
     NSMutableArray<NSDictionary *> *out = [NSMutableArray array];
     for (NSDictionary *bundle in bundles) {
         NSInteger sec = [bundle[@"section"] integerValue];
-        if ([self rowsForSection:sec].count > 0 || sec == SectionAppDowngrade) {
+        if ([self rowsForSection:sec].count > 0 || sec == SectionAppDowngrade || sec == SectionAppDecryption) {
             [out addObject:bundle];
         }
     }
@@ -2798,13 +3198,16 @@ static void downgrade_trigger_in_springboard(NSString *trackIdStr, NSString *ver
     if (s == SectionAppDowngrade) {
         return @"Injects a payload into SpringBoard to trigger an App Store download using SKUIItemStateCenter with a spoofed version ID, allowing app downgrades without a traditional jailbreak.";
     }
+    if (s == SectionAppDecryption) {
+        return @"Dumps an installed App's memory to bypass DRM encryption, then packages it into an IPA using our built-in kernel primitives.";
+    }
     return nil;
 }
 
 - (CGFloat)tableView:(UITableView *)tableView heightForHeaderInSection:(NSInteger)section
 {
     if (!self.detailMode) {
-        if (section == RootSectionWarning) return 18.0; // breathing room above warning
+        if (section == RootSectionWarning) return 18.0;
         if ((RootSection)section == RootSectionTweakBundles  && self.tweakBundleRows.count  == 0) return CGFLOAT_MIN;
         if ((RootSection)section == RootSectionSystemBundles && self.systemBundleRows.count == 0) return CGFLOAT_MIN;
     }
@@ -3345,6 +3748,12 @@ static void cyanide_upload_log_if_enabled(void) {
                 
                 if (underlying == SectionAppDowngrade) {
                     AppListViewController *appListVC = [[AppListViewController alloc] init];
+                    [self.navigationController pushViewController:appListVC animated:YES];
+                    return;
+                }
+                
+                if (underlying == SectionAppDecryption) {
+                    AppDecryptionListViewController *appListVC = [[AppDecryptionListViewController alloc] init];
                     [self.navigationController pushViewController:appListVC animated:YES];
                     return;
                 }
