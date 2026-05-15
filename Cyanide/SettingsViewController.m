@@ -59,8 +59,8 @@
 
     NSURL *url = [NSURL URLWithString:@"https://zeroxjf.github.io/lightsaber/respring.html"];
     [self.webView loadRequest:[NSURLRequest requestWithURL:url
-                                              cachePolicy:NSURLRequestReloadIgnoringLocalAndRemoteCacheData
-                                          timeoutInterval:10]];
+                                               cachePolicy:NSURLRequestReloadIgnoringLocalAndRemoteCacheData
+                                           timeoutInterval:10]];
 }
 
 - (void)dismissSelf {
@@ -603,8 +603,8 @@ static void settings_request_all_live_loops_stop(const char *reason)
 }
 
 static void settings_live_loop_sleep_interruptible(uint64_t targetUS,
-                                                  useconds_t fallbackUS,
-                                                  volatile int *stopFlag)
+                                                 useconds_t fallbackUS,
+                                                 volatile int *stopFlag)
 {
     uint64_t sleptFallbackUS = 0;
     while (!settings_cleanup_in_progress() && (!stopFlag || *stopFlag == 0)) {
@@ -1880,9 +1880,8 @@ void settings_register_defaults(void)
         kSettingsRSSIDisplayCell:    @YES,
 
         kSettingsAxonLiteEnabled: @NO,
+        kSettingsLogUploadEnabled: @NO,
     }];
-    // Signal Readouts is temporarily blocked from installation because its
-    // live RemoteCall refresh still interferes with other SpringBoard tweaks.
     if ([defaults boolForKey:kSettingsRSSIDisplayEnabled]) {
         [defaults setBool:NO forKey:kSettingsRSSIDisplayEnabled];
         [defaults synchronize];
@@ -2797,8 +2796,8 @@ static void cyanide_upload_log_if_enabled(void) {
     if (vc.popoverPresentationController) {
         vc.popoverPresentationController.sourceView = self.view;
         vc.popoverPresentationController.sourceRect = CGRectMake(self.view.bounds.size.width / 2.0,
-                                                                  self.view.bounds.size.height / 2.0,
-                                                                  0, 0);
+                                                                 self.view.bounds.size.height / 2.0,
+                                                                 0, 0);
         vc.popoverPresentationController.permittedArrowDirections = 0;
     }
     [self presentViewController:vc animated:YES completion:nil];
@@ -3123,7 +3122,7 @@ static void cyanide_upload_log_if_enabled(void) {
                 NSInteger underlying = [bundle[@"section"] integerValue];
                 NSString *pushTitle = bundle[@"title"];
                 SettingsViewController *detail = [[SettingsViewController alloc] initWithUnderlyingSection:underlying
-                                                                                              bundleTitle:pushTitle];
+                                                                                             bundleTitle:pushTitle];
                 [self.navigationController pushViewController:detail animated:YES];
                 return;
             }
