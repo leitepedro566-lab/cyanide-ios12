@@ -1,7 +1,7 @@
 name: Build Cyanide IPA (Manual)
 
 on:
-  # 纯手动运行：移除 push 和 pull_request 触发器，仅保留 workflow_dispatch
+
   workflow_dispatch: 
 
 jobs:
@@ -13,7 +13,7 @@ jobs:
       - name: Checkout Repository
         uses: actions/checkout@v4
         with:
-          submodules: recursive # 确保完整拉取 external/ChOma 等子模块
+          submodules: recursive 
           fetch-depth: 0
 
       - name: Setup Xcode
@@ -23,17 +23,17 @@ jobs:
 
       - name: Install Dependencies
         run: |
-          # 安装 ldid (用于 XPF 的伪签名) 和 xcbeautify (用于格式化 Xcode 输出)
+          
           brew install ldid xcbeautify
 
       - name: Build libxpf.dylib (XPF Framework)
         run: |
-          # 关键步骤：在打包 APP 前，必须先通过 Makefile 编译底层的 XPF 动态库
+          
           echo "==> Building XPF Framework..."
           cd Cyanide/XPF
           make
           
-          # 验证生成，如果未生成会在此处报错阻断，避免打出残缺的 IPA
+          
           ls -la output/ios/libxpf.dylib
           echo "==> XPF Framework built successfully."
 
@@ -47,7 +47,7 @@ jobs:
           CONFIG: Release
           SDK: iphoneos
         run: |
-          # 现在执行构建脚本，Xcode 就能找到刚刚编译好的 libxpf.dylib 并将其打包进 .app 中
+          
           ./scripts/build.sh
 
       - name: Upload IPA Artifact
